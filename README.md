@@ -8,37 +8,59 @@
 
 ## Key Results
 
-Cron Root Attention achieves **up to 202x kernel speedups** over standard SDPA/FlashAttention at long sequence lengths by reducing attention complexity from O(N²) to O(N√N), with **100% token coverage** through a 3-phase relay mechanism.
+Cron Root Attention achieves **up to 58x forward kernel speedup** over SDPA/FlashAttention-2 at long sequence lengths by reducing attention complexity from O(N²) to O(N√N), with **100% token coverage** through a 3-phase relay mechanism. Crossover point is ~2K tokens — above that, Cron Root is strictly faster.
 
 ### Forward Pass Benchmarks (Kernel Only)
 
-| Sequence Length | Cron Root | SDPA | Speedup |
-|-----------------|-----------|------|---------|
-| 1,024 | 0.03ms | 0.06ms | **2.0x** |
-| 4,096 | 0.04ms | 0.50ms | **12.7x** |
-| 16,384 | 0.22ms | 6.33ms | **28.2x** |
-| 32,768 | 0.59ms | 24.1ms | **40.6x** |
-| 65,536 | 0.77ms | 50.9ms | **66.1x** |
-| 131,072 | 2.08ms | 203ms | **97.6x** |
-| 262,144 | 5.47ms | 809ms | **148x** |
-| 524,288 | 15.1ms | 3050ms | **202x** |
+| Sequence Length | Cron Root | SDPA (Flash) | Speedup |
+|-----------------|-----------|--------------|----------|
+| 512 | 0.103ms | 0.024ms | 0.23x |
+| 1,024 | 0.070ms | 0.037ms | 0.48x |
+| 2,048 | 0.089ms | 0.111ms | **1.24x** |
+| 4,096 | 0.102ms | 0.286ms | **2.80x** |
+| 8,192 | 0.215ms | 0.923ms | **4.25x** |
+| 16,384 | 0.341ms | 3.37ms | **9.77x** |
+| 32,768 | 1.15ms | 12.8ms | **11.2x** |
+| 65,536 | 2.33ms | 48.5ms | **20.9x** |
+| 131,072 | 7.36ms | 192ms | **26.2x** |
+| 262,144 | 17.3ms | 765ms | **44.3x** |
+| 524,288 | 52.4ms | 3054ms | **58.2x** |
 
-*Benchmarked on RTX 5070 Ti (Blackwell GB203), FP16, B=1, H=8, D=64*
+*Measured on RTX 5070 Ti (Blackwell GB203), PyTorch 2.9.1, CUDA 12.8, FP16, B=1, H=8, D=64. CUDA event timing, trimmed mean of 30 runs.*
 
 ### End-to-End Training Performance (Forward + Backward)
 
-| Sequence Length | Cron Root Fwd | Cron Root Bwd | SDPA Total | Training Speedup |
-|-----------------|---------------|---------------|------------|------------------|
-| 4,096 | 0.053ms | 0.71ms | 0.94ms | **1.20x** |
-| 8,192 | 0.079ms | 1.74ms | 2.95ms | **1.63x** |
-| 16,384 | 0.168ms | 4.51ms | 11.21ms | **2.49x** |
-| 32,768 | 0.331ms | 12.04ms | 43.17ms | **3.38x** |
-| 65,536 | 0.771ms | 32.52ms | 168.25ms | **5.05x** |
-| 131,072 | 2.077ms | 91.95ms | 670.93ms | **7.16x** |
+| Sequence Length | Cron Root (Fwd+Bwd) | SDPA (Fwd+Bwd) | Training Speedup |
+|-----------------|---------------------|----------------|------------------|
+| 512 | 0.347ms | 0.107ms | 0.31x |
+| 1,024 | 0.405ms | 0.139ms | 0.34x |
+| 2,048 | 0.707ms | 0.347ms | 0.49x |
+| 4,096 | 1.39ms | 0.925ms | 0.67x |
+| 8,192 | 3.39ms | 2.91ms | 0.86x |
+| 16,384 | 8.69ms | 11.1ms | **1.28x** |
+| 32,768 | 24.5ms | 43.1ms | **1.76x** |
+| 65,536 | 65.9ms | 170ms | **2.58x** |
+| 131,072 | 186ms | 676ms | **3.64x** |
 
-The training speedup uses our **key-centric backward pass** which eliminates atomic contention.
+Training crossover is ~12K tokens. The backward pass uses our **key-centric** kernels with zero atomic contention.
 
-> **Note**: Attention is ~30-40% of total training compute. The remaining FFN, LayerNorm, and embedding operations limit the theoretical maximum speedup per Amdahl's Law. For **inference-only** workloads, the full 202x kernel speedup applies.
+### Inference Benchmarks (no_grad prefill)
+
+| Sequence Length | Cron Root | SDPA (Flash) | Inference Speedup |
+|-----------------|-----------|--------------|-------------------|
+| 512 | 0.078ms | 0.022ms | 0.27x |
+| 1,024 | 0.061ms | 0.034ms | 0.56x |
+| 2,048 | 0.091ms | 0.111ms | **1.20x** |
+| 4,096 | 0.093ms | 0.289ms | **3.07x** |
+| 8,192 | 0.185ms | 0.924ms | **5.01x** |
+| 16,384 | 0.339ms | 3.37ms | **9.89x** |
+| 32,768 | 1.16ms | 12.6ms | **10.8x** |
+| 65,536 | 2.29ms | 48.6ms | **21.2x** |
+| 131,072 | 7.39ms | 193ms | **26.0x** |
+| 262,144 | 17.3ms | 766ms | **44.3x** |
+| 524,288 | 52.4ms | 2984ms | **57.0x** |
+
+> **Note**: Attention is ~30-40% of total training compute. The remaining FFN, LayerNorm, and embedding operations limit the theoretical maximum speedup per Amdahl's Law. For **inference-only** workloads (prefill), the full kernel speedup applies directly. Use the **hybrid mode** to auto-select SDPA for short sequences and Cron Root for long sequences.
 
 ## 📦 Installation
 

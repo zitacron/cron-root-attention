@@ -23,7 +23,7 @@
 \maketitle
 
 \begin{abstract}
-We introduce Cron Root Attention, a sparse attention mechanism that reduces the computational complexity of self-attention from $O(N^2)$ to $O(N\sqrt{N})$ while preserving causal language modeling semantics. Our method combines three phases: (1) a local sliding window of size $\sqrt{N}$, (2) a strided global window of size $\sqrt{N}$, and (3) a \textbf{relay mechanism} that carries block-mean compressed key/value summaries from $\sqrt{N}$ blocks, enabling full-sequence coverage through a single softmax pass. Each query attends to $O(3\sqrt{N})$ positions, achieving 100\% token coverage without gradient dilution. We implement optimized Triton kernels with key-centric backward passes and zero-atomic relay gradients that achieve up to \textbf{202x forward kernel speedup} at sequence length 524K and \textbf{7.16x end-to-end training speedup} at 128K tokens. Our implementation supports 40+ GPU models from consumer (RTX 20/30/40/50 series) to datacenter (H100, H800, A100, V100) hardware with automatic SM detection. We release Cron Root Attention as an open-source pip package under Apache 2.0 license.
+We introduce Cron Root Attention, a sparse attention mechanism that reduces the computational complexity of self-attention from $O(N^2)$ to $O(N\sqrt{N})$ while preserving causal language modeling semantics. Our method combines three phases: (1) a local sliding window of size $\sqrt{N}$, (2) a strided global window of size $\sqrt{N}$, and (3) a \textbf{relay mechanism} that carries block-mean compressed key/value summaries from $\sqrt{N}$ blocks, enabling full-sequence coverage through a single softmax pass. Each query attends to $O(3\sqrt{N})$ positions, achieving 100\% token coverage without gradient dilution. We implement optimized Triton kernels with key-centric backward passes and zero-atomic relay gradients that achieve up to \textbf{58x forward kernel speedup} at sequence length 524K and \textbf{3.64x end-to-end training speedup} at 131K tokens. Our implementation supports 40+ GPU models from consumer (RTX 20/30/40/50 series) to datacenter (H100, H800, A100, V100) hardware with automatic SM detection. We release Cron Root Attention as an open-source pip package under Apache 2.0 license.
 \end{abstract}
 
 \section{Introduction}
@@ -42,8 +42,8 @@ yields $O(N\sqrt{N})$ total complexity while providing \textbf{100\% sequence co
 
 \begin{itemize}
     \item We formalize the $\sqrt{N}$ attention pattern and prove its $O(N\sqrt{N})$ complexity with 2-hop universal reachability (Section \ref{sec:method}).
-    \item We develop block-query tiled Triton kernels with key-centric backward passes achieving 202x forward speedup at 512K tokens (Section \ref{sec:implementation}).
-    \item We demonstrate 7.16x end-to-end training speedup at 128K sequence length (Section \ref{sec:experiments}).
+    \item We develop block-query tiled Triton kernels with key-centric backward passes achieving 58x forward speedup at 524K tokens (Section \ref{sec:implementation}).
+    \item We demonstrate 3.64x end-to-end training speedup at 131K sequence length (Section \ref{sec:experiments}).
     \item We release a pip-installable package with automatic GPU detection supporting 40+ GPU models (Section \ref{sec:code}).
 \end{itemize}
 
@@ -202,46 +202,48 @@ Key optimizations for broad GPU support:
 
 \begin{table}[h]
 \centering
-\caption{Forward pass kernel latency on RTX 5070 Ti (B=1, H=8, D=64, FP16)}
+\caption{Forward pass kernel latency on RTX 5070 Ti (B=1, H=8, D=64, FP16, PyTorch 2.9.1 + CUDA 12.8)}
 \begin{tabular}{lrrr}
 \toprule
-Seq Length & SDPA (ms) & Cron Root (ms) & Speedup \\
+Seq Length & SDPA/Flash (ms) & Cron Root (ms) & Speedup \\
 \midrule
-4,096 & 0.50 & 0.04 & 12.7x \\
-16,384 & 6.33 & 0.22 & 28.2x \\
-32,768 & 24.1 & 0.59 & 40.6x \\
-65,536 & 50.9 & 0.77 & 66.1x \\
-131,072 & 203 & 2.08 & 97.6x \\
-262,144 & 809 & 5.47 & 148x \\
-524,288 & 3050 & 15.1 & \textbf{202x} \\
+2,048 & 0.11 & 0.09 & 1.24x \\
+4,096 & 0.29 & 0.10 & 2.80x \\
+8,192 & 0.92 & 0.22 & 4.25x \\
+16,384 & 3.37 & 0.34 & 9.77x \\
+32,768 & 12.8 & 1.15 & 11.2x \\
+65,536 & 48.5 & 2.33 & 20.9x \\
+131,072 & 192 & 7.36 & 26.2x \\
+262,144 & 765 & 17.3 & 44.3x \\
+524,288 & 3054 & 52.4 & \textbf{58.2x} \\
 \bottomrule
 \end{tabular}
 \label{tab:kernel}
 \end{table}
 
-The subquadratic scaling is evident: at 512K tokens, Cron Root Attention is 202x faster than SDPA, demonstrating the $O(N\sqrt{N})$ vs $O(N^2)$ complexity difference.
+The subquadratic scaling is evident: at 524K tokens, Cron Root Attention is 58x faster than SDPA (which uses FlashAttention-2 as its backend), demonstrating the $O(N\sqrt{N})$ vs $O(N^2)$ complexity difference. The crossover point where Cron Root becomes faster is approximately 2K tokens for forward passes and 12K tokens for full training (forward + backward).
 
 \subsection{End-to-End Training Performance}
 
 \begin{table}[h]
 \centering
-\caption{Complete forward + backward pass timing (B=1, H=8, D=64)}
-\begin{tabular}{lrrrr}
+\caption{Complete forward + backward pass timing (B=1, H=8, D=64, PyTorch 2.9.1 + CUDA 12.8)}
+\begin{tabular}{lrrr}
 \toprule
-Seq Length & Cron Root Fwd (ms) & Cron Root Bwd (ms) & SDPA Total (ms) & Speedup \\
+Seq Length & Cron Root Fwd+Bwd (ms) & SDPA Fwd+Bwd (ms) & Speedup \\
 \midrule
-4K & 0.053 & 0.71 & 0.94 & 1.20x \\
-8K & 0.079 & 1.74 & 2.95 & 1.63x \\
-16K & 0.168 & 4.51 & 11.21 & 2.49x \\
-32K & 0.331 & 12.04 & 43.17 & 3.38x \\
-64K & 0.771 & 32.52 & 168.25 & 5.05x \\
-128K & 2.077 & 91.95 & 670.93 & \textbf{7.16x} \\
+4K & 1.39 & 0.93 & 0.67x \\
+8K & 3.39 & 2.91 & 0.86x \\
+16K & 8.69 & 11.1 & 1.28x \\
+32K & 24.5 & 43.1 & 1.76x \\
+64K & 65.9 & 170 & 2.58x \\
+128K & 186 & 676 & \textbf{3.64x} \\
 \bottomrule
 \end{tabular}
 \label{tab:training}
 \end{table}
 
-Training speedup increases with sequence length due to the quadratic vs subquadratic scaling gap. At 128K tokens, we achieve 7.16x end-to-end speedup. Note that attention is approximately 30-40\% of total training compute; the remaining FFN, LayerNorm, and embedding operations limit the theoretical maximum speedup per Amdahl's Law.
+Training speedup increases with sequence length due to the quadratic vs subquadratic scaling gap. At 131K tokens, we achieve 3.64x end-to-end speedup. Note that the backward pass has higher constant overhead due to four separate kernels (dQ, local dK/dV, strided dK/dV, relay dK/dV), which explains the higher crossover point (~12K) compared to forward-only (~2K). Attention is approximately 30-40\% of total training compute; the remaining FFN, LayerNorm, and embedding operations limit the theoretical maximum speedup per Amdahl's Law.
 
 \subsection{Correctness Validation}
 
@@ -307,7 +309,7 @@ Datacenter & H100, H200, H800, A100, L40S, L4, V100, B100, B200 \\
 
 \section{Conclusion}
 
-Cron Root Attention achieves true subquadratic scaling ($O(N\sqrt{N})$) with practical speedups up to 202x for forward passes and 7.16x for complete training at long sequence lengths. Our 3-phase architecture (local + strided + relay) provides 100\% sequence coverage through a single softmax pass, eliminating the gradient dilution problem that plagues multi-hop sparse attention. The key-centric backward pass with zero-atomic relay gradients eliminates contention, and automatic GPU detection ensures broad hardware compatibility. The pip-installable package provides drop-in replacement modules for immediate adoption in long-context LLM training and inference.
+Cron Root Attention achieves true subquadratic scaling ($O(N\sqrt{N})$) with practical speedups up to 58x for forward passes and 3.64x for complete training at long sequence lengths. Our 3-phase architecture (local + strided + relay) provides 100\% sequence coverage through a single softmax pass, eliminating the gradient dilution problem that plagues multi-hop sparse attention. The key-centric backward pass with zero-atomic relay gradients eliminates contention, and automatic GPU detection ensures broad hardware compatibility. The pip-installable package provides drop-in replacement modules for immediate adoption in long-context LLM training and inference.
 
 \section*{Acknowledgments}
 

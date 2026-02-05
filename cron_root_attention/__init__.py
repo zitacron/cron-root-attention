@@ -23,14 +23,17 @@ Supported GPUs:
     - NVIDIA B100, B200, GB200 (Blackwell datacenter)
     - Auto-detection of SM count for optimal grid sizing
 
-Key Results (RTX 5070 Ti, FP16):
-    S=16384:  28.2x kernel speedup
-    S=65536:  66.1x kernel speedup
-    S=131072: 97.6x kernel speedup
-    S=262144: 148x kernel speedup  
-    S=524288: 202x kernel speedup
+Key Results (RTX 5070 Ti, FP16, PyTorch 2.9.1 + CUDA 12.8):
+    Forward pass (kernel only):
+        S=4096:   2.80x speedup vs SDPA/Flash
+        S=16384:  9.77x speedup
+        S=65536:  20.9x speedup
+        S=131072: 26.2x speedup
+        S=262144: 44.3x speedup  
+        S=524288: 58.2x speedup
     
-    Training (128K): 7.16x end-to-end speedup
+    Training (fwd+bwd, 131K): 3.64x end-to-end speedup
+    Inference (no_grad, 524K): 57.0x speedup
 
 Usage:
     from cron_root_attention import cron_root_attention, CronRootAttention
