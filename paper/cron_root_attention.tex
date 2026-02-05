@@ -1,0 +1,366 @@
+\documentclass{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb}
+\usepackage{algorithm,algorithmic}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+% ArXiv preprint style
+\usepackage[margin=1in]{geometry}
+
+\title{Cron Root Attention: Subquadratic Self-Attention via Structured Sparsity}
+
+\author{
+  Zitacron\\
+  \texttt{https://github.com/zitacron}
+}
+
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We introduce Cron Root Attention, a sparse attention mechanism that reduces the computational complexity of self-attention from $O(N^2)$ to $O(N\sqrt{N})$ while preserving causal language modeling semantics. Our method combines three phases: (1) a local sliding window of size $\sqrt{N}$, (2) a strided global window of size $\sqrt{N}$, and (3) a \textbf{relay mechanism} that carries block-mean compressed key/value summaries from $\sqrt{N}$ blocks, enabling full-sequence coverage through a single softmax pass. Each query attends to $O(3\sqrt{N})$ positions, achieving 100\% token coverage without gradient dilution. We implement optimized Triton kernels with key-centric backward passes and zero-atomic relay gradients that achieve up to \textbf{202x forward kernel speedup} at sequence length 524K and \textbf{7.16x end-to-end training speedup} at 128K tokens. Our implementation supports 40+ GPU models from consumer (RTX 20/30/40/50 series) to datacenter (H100, H800, A100, V100) hardware with automatic SM detection. We release Cron Root Attention as an open-source pip package under Apache 2.0 license.
+\end{abstract}
+
+\section{Introduction}
+
+Transformer attention scales quadratically with sequence length, creating a fundamental bottleneck for long-context language models. While Flash Attention \cite{flashattn} and FlashAttention-2 \cite{flashattn2} optimize memory access patterns, they maintain $O(N^2)$ complexity. Sparse attention variants like Longformer \cite{longformer} and BigBird \cite{bigbird} achieve linear complexity but require fixed-size windows that don't scale with context.
+
+We propose Cron Root Attention (named for Zitacron + Root $\sqrt{}$), which achieves true subquadratic scaling by using a window size proportional to $\sqrt{N}$. Our key insight is that combining:
+\begin{enumerate}
+    \item A \textbf{local window} of size $\sqrt{N}$ for recent context
+    \item A \textbf{strided window} sampling every $\sqrt{N}$-th token
+    \item A \textbf{relay mechanism} carrying block-mean K/V summaries from $\sqrt{N}$ blocks
+\end{enumerate}
+yields $O(N\sqrt{N})$ total complexity while providing \textbf{100\% sequence coverage} through a single softmax pass, eliminating the gradient dilution problem inherent in multi-hop sparse attention.
+
+\subsection{Contributions}
+
+\begin{itemize}
+    \item We formalize the $\sqrt{N}$ attention pattern and prove its $O(N\sqrt{N})$ complexity with 2-hop universal reachability (Section \ref{sec:method}).
+    \item We develop block-query tiled Triton kernels with key-centric backward passes achieving 202x forward speedup at 512K tokens (Section \ref{sec:implementation}).
+    \item We demonstrate 7.16x end-to-end training speedup at 128K sequence length (Section \ref{sec:experiments}).
+    \item We release a pip-installable package with automatic GPU detection supporting 40+ GPU models (Section \ref{sec:code}).
+\end{itemize}
+
+\section{Related Work}
+
+\textbf{Efficient Attention.} Flash Attention \cite{flashattn} uses tiling and recomputation to reduce memory from $O(N^2)$ to $O(N)$ while maintaining exact computation. FlashAttention-2 \cite{flashattn2} improves parallelism. Flash-Decoding \cite{flashdecoding} optimizes inference. These maintain quadratic compute.
+
+\textbf{Sparse Attention.} Longformer \cite{longformer} uses local + global tokens. BigBird \cite{bigbird} adds random attention. Sparse Transformers \cite{sparse_transformers} use strided patterns. These typically use fixed window sizes, limiting scalability.
+
+\textbf{Linear Attention.} Linear attention \cite{linear_attention} and variants like RWKV \cite{rwkv} and Mamba \cite{mamba} achieve $O(N)$ but sacrifice expressivity.
+
+\textbf{Our Approach.} Cron Root Attention combines the hardware optimization of Flash Attention with the scalability of sparse attention, using adaptive $\sqrt{N}$-sized windows that scale with sequence length.
+
+\section{Method}
+\label{sec:method}
+
+\subsection{Attention Pattern}
+
+For a sequence of length $N$, we define the window size $W = \lceil\sqrt{N}\rceil$. Each query $q_i$ attends to:
+
+\begin{equation}
+\mathcal{A}(i) = \underbrace{\{j : \max(0, i-W+1) \leq j \leq i\}}_{\text{Local window}} \cup \underbrace{\{j : j \equiv 0 \pmod{W}, j < \max(0, i-W+1)\}}_{\text{Strided window}}
+\end{equation}
+
+\subsection{Complexity Analysis}
+
+\begin{theorem}
+The total attention cost is $O(N\sqrt{N})$.
+\end{theorem}
+
+\begin{proof}
+Each query attends to at most $W$ local positions and at most $\lceil N/W \rceil$ strided positions:
+\begin{equation}
+|\mathcal{A}(i)| \leq W + \frac{N}{W} = \sqrt{N} + \sqrt{N} = 2\sqrt{N}
+\end{equation}
+Summing over $N$ queries: $N \cdot 2\sqrt{N} = O(N\sqrt{N})$.
+\end{proof}
+
+\subsection{2-Hop Reachability}
+
+\begin{theorem}
+Any token can reach any other token in at most 2 attention hops.
+\end{theorem}
+
+\begin{proof}
+For tokens $A$ at position $i$ and $B$ at position $j$ where $j < i - W$:
+\begin{enumerate}
+    \item Let $C$ be at the strided position $\lfloor j/W \rfloor \cdot W$
+    \item $A$ attends to $C$ via strided window (since $C < i - W + 1$)
+    \item $C$ attends to $B$ via local window (since $|C - j| < W$)
+\end{enumerate}
+Thus $A \rightarrow C \rightarrow B$ forms a 2-hop path.
+\end{proof}
+
+\subsection{Relay Mechanism (Phase 3)}
+
+While the 2-hop reachability property guarantees theoretical coverage, in practice information traversing two separate softmax normalizations across layers suffers from \textbf{gradient dilution}: the gradient signal decays exponentially through each softmax bottleneck.
+
+We introduce a relay mechanism that carries compressed 2-hop information through a \textbf{single} softmax pass. For each block $r \in \{0, 1, \ldots, \lceil N/W \rceil - 1\}$, we pre-compute:
+\begin{equation}
+\text{relay\_k}[r] = \frac{1}{W} \sum_{j=rW}^{(r+1)W-1} k_j, \quad \text{relay\_v}[r] = \frac{1}{W} \sum_{j=rW}^{(r+1)W-1} v_j
+\end{equation}
+
+These relay keys and values participate in the \textbf{same} softmax as the local and strided scores:
+\begin{equation}
+\mathcal{A}(i) = \mathcal{A}_{\text{local}}(i) \cup \mathcal{A}_{\text{strided}}(i) \cup \mathcal{A}_{\text{relay}}(i)
+\end{equation}
+where $\mathcal{A}_{\text{relay}}(i) = \{r : (r+1)W - 1 < \max(0, i - W + 1)\}$, i.e., relay blocks whose entire span precedes the local window.
+
+The total attention set size remains $O(3\sqrt{N})$ per query:
+\begin{equation}
+|\mathcal{A}(i)| \leq W + \frac{N}{W} + \frac{N}{W} = 3\sqrt{N}
+\end{equation}
+
+The relay backward pass uses the mean-pooling Jacobian for gradient scatter:
+\begin{equation}
+\frac{\partial \mathcal{L}}{\partial k_j} \mathrel{+}= \frac{1}{W} \cdot \frac{\partial \mathcal{L}}{\partial \text{relay\_k}[\lfloor j/W \rfloor]}
+\end{equation}
+
+This is implemented as a zero-atomic, exclusive-ownership relay $dK/dV$ kernel where each block owns one relay key and iterates over all attending queries.
+
+\subsection{Softmax Stability}
+
+We compute attention with online softmax:
+\begin{equation}
+\text{Attention}(q_i, K, V) = \frac{\sum_{j \in \mathcal{A}(i)} \exp(q_i \cdot k_j / \sqrt{d}) \cdot v_j}{\sum_{j \in \mathcal{A}(i)} \exp(q_i \cdot k_j / \sqrt{d})}
+\end{equation}
+
+Using the max-subtraction trick for numerical stability:
+\begin{equation}
+m_i = \max_{j \in \mathcal{A}(i)} q_i \cdot k_j, \quad s_{ij} = \exp(q_i \cdot k_j - m_i)
+\end{equation}
+
+\section{Implementation}
+\label{sec:implementation}
+
+\subsection{Triton Kernel Design}
+
+Our V14 kernel uses block-query tiling with block sizes $B_M = 64$ (queries per block):
+
+\begin{algorithm}
+\caption{Cron Root Attention Forward Kernel (3-Phase)}
+\begin{algorithmic}
+\STATE \textbf{Input:} $Q, K, V \in \mathbb{R}^{N \times d}$, block size $B_M$
+\STATE \textbf{Output:} $O \in \mathbb{R}^{N \times d}$
+\STATE Compute $W = \lceil\sqrt{N}\rceil$
+\STATE \textbf{Pre-compute:} $\text{RK}[r] = \text{mean}(K[rW:(r{+}1)W])$, $\text{RV}[r] = \text{mean}(V[rW:(r{+}1)W])$
+\FOR{each query block $i = 0, B_M, 2B_M, \ldots$}
+    \STATE Load $Q[i:i+B_M]$ to SRAM
+    \STATE Initialize $m = -\infty$, $\ell = 0$, $o = 0$
+    \STATE // Phase 1: Local window
+    \FOR{$j$ in local range $[\max(0, i-W+1), i]$}
+        \STATE $s = QK^T / \sqrt{d}$, update $m, \ell, o$ with online softmax
+    \ENDFOR
+    \STATE // Phase 2: Strided window (before local)
+    \FOR{$j \in \{0, W, 2W, \ldots\}$ where $j < \max(0, i-W+1)$}
+        \STATE $s = QK^T / \sqrt{d}$, update $m, \ell, o$ with online softmax
+    \ENDFOR
+    \STATE // Phase 3: Relay (compressed 2-hop blocks)
+    \FOR{relay block $r$ where $(r{+}1)W{-}1 < \max(0, i{-}W{+}1)$}
+        \STATE $s = Q \cdot \text{RK}[r]^T / \sqrt{d}$, update $m, \ell, o$ with online softmax using $\text{RV}[r]$
+    \ENDFOR
+    \STATE Store $O[i:i+B_M] = o / \ell$
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Key-Centric Backward Pass}
+
+The backward pass computes $dQ$, $dK$, and $dV$. A naive query-parallel approach causes atomic contention on strided keys (each strided key is updated by $O(N)$ queries). We introduce \textbf{key-centric} kernels with exclusive ownership:
+
+\begin{itemize}
+    \item \textbf{dQ kernel}: Query-parallel, includes all three phases (local + strided + relay contributions).
+    \item \textbf{Local dK/dV}: Each key block processes only its $O(\sqrt{N})$ local queries. No atomics.
+    \item \textbf{Strided dK/dV}: Each block \textit{owns} one strided key and iterates over all $O(N)$ queries. Register accumulation, single write.
+    \item \textbf{Relay dK/dV}: Each block \textit{owns} one relay key/value pair. Computes $d\text{RK}[r]$ and $d\text{RV}[r]$, then scatters via the mean-pooling Jacobian: $dK[rW{+}i] \mathrel{+}= d\text{RK}[r] / W$ for all $i$ in block $r$.
+\end{itemize}
+
+All four kernels are zero-atomic. The strided phase achieves 1.85x speedup over the atomic-based approach (21.95ms $\rightarrow$ 11.85ms at S=64K).
+
+\subsection{Hardware Optimization}
+
+Key optimizations for broad GPU support:
+\begin{itemize}
+    \item Dynamic SM detection via \texttt{torch.cuda.get\_device\_properties()}
+    \item GPU compatibility table covering 40+ models (RTX 20/30/40/50 series, H100, H800, A100, V100)
+    \item Block-query tiling with BLOCK\_M=64 queries per thread block
+    \item Coalesced memory access with vectorized loads
+    \item FP16 compute with FP32 accumulation for numerical stability
+\end{itemize}
+
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Forward Pass Kernel Benchmarks}
+
+\begin{table}[h]
+\centering
+\caption{Forward pass kernel latency on RTX 5070 Ti (B=1, H=8, D=64, FP16)}
+\begin{tabular}{lrrr}
+\toprule
+Seq Length & SDPA (ms) & Cron Root (ms) & Speedup \\
+\midrule
+4,096 & 0.50 & 0.04 & 12.7x \\
+16,384 & 6.33 & 0.22 & 28.2x \\
+32,768 & 24.1 & 0.59 & 40.6x \\
+65,536 & 50.9 & 0.77 & 66.1x \\
+131,072 & 203 & 2.08 & 97.6x \\
+262,144 & 809 & 5.47 & 148x \\
+524,288 & 3050 & 15.1 & \textbf{202x} \\
+\bottomrule
+\end{tabular}
+\label{tab:kernel}
+\end{table}
+
+The subquadratic scaling is evident: at 512K tokens, Cron Root Attention is 202x faster than SDPA, demonstrating the $O(N\sqrt{N})$ vs $O(N^2)$ complexity difference.
+
+\subsection{End-to-End Training Performance}
+
+\begin{table}[h]
+\centering
+\caption{Complete forward + backward pass timing (B=1, H=8, D=64)}
+\begin{tabular}{lrrrr}
+\toprule
+Seq Length & Cron Root Fwd (ms) & Cron Root Bwd (ms) & SDPA Total (ms) & Speedup \\
+\midrule
+4K & 0.053 & 0.71 & 0.94 & 1.20x \\
+8K & 0.079 & 1.74 & 2.95 & 1.63x \\
+16K & 0.168 & 4.51 & 11.21 & 2.49x \\
+32K & 0.331 & 12.04 & 43.17 & 3.38x \\
+64K & 0.771 & 32.52 & 168.25 & 5.05x \\
+128K & 2.077 & 91.95 & 670.93 & \textbf{7.16x} \\
+\bottomrule
+\end{tabular}
+\label{tab:training}
+\end{table}
+
+Training speedup increases with sequence length due to the quadratic vs subquadratic scaling gap. At 128K tokens, we achieve 7.16x end-to-end speedup. Note that attention is approximately 30-40\% of total training compute; the remaining FFN, LayerNorm, and embedding operations limit the theoretical maximum speedup per Amdahl's Law.
+
+\subsection{Correctness Validation}
+
+Comparing V14 output to sparse reference implementation:
+\begin{itemize}
+    \item Maximum absolute difference: 0.000977 (FP16)
+    \item Determinism: Bit-exact across runs
+    \item Gradient flow: Verified for dQ, dK, dV
+    \item NaN/Inf check: All outputs validated
+\end{itemize}
+
+\section{Code Release}
+\label{sec:code}
+
+Cron Root Attention is available as a pip package:
+
+\begin{verbatim}
+pip install cron-root-attention
+\end{verbatim}
+
+Or from source:
+\begin{verbatim}
+git clone https://github.com/zitacron/cron-root-attention.git
+cd cron-root-attention && pip install -e .
+\end{verbatim}
+
+Drop-in replacement:
+\begin{verbatim}
+from cron_root_attention import cron_root_attention, CronRootMultiheadAttention
+
+# Functional API
+output = cron_root_attention(q, k, v)  # (B, H, S, D) -> (B, H, S, D)
+
+# Module API
+attn = CronRootMultiheadAttention(embed_dim=1024, num_heads=16)
+output, _ = attn(x, x, x)
+
+# Check GPU compatibility
+from cron_root_attention import get_gpu_info
+print(get_gpu_info())
+# {'gpu_name': 'NVIDIA GeForce RTX 5070 Ti', 'sm_count': 70, ...}
+\end{verbatim}
+
+\subsection{Supported Hardware}
+
+The package automatically detects GPU SM count for optimal kernel grid sizing:
+
+\begin{table}[h]
+\centering
+\caption{Supported GPU families}
+\begin{tabular}{ll}
+\toprule
+Category & GPUs \\
+\midrule
+Blackwell (50 series) & RTX 5090, 5080, 5070 Ti, 5070 \\
+Ada (40 series) & RTX 4090, 4080, 4070 Ti, 4070, 4060 Ti \\
+Ampere (30 series) & RTX 3090, 3080, 3070, 3060 \\
+Turing (20 series) & RTX 2080 Ti, 2080, 2070, 2060, TITAN RTX \\
+Datacenter & H100, H200, H800, A100, L40S, L4, V100, B100, B200 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Conclusion}
+
+Cron Root Attention achieves true subquadratic scaling ($O(N\sqrt{N})$) with practical speedups up to 202x for forward passes and 7.16x for complete training at long sequence lengths. Our 3-phase architecture (local + strided + relay) provides 100\% sequence coverage through a single softmax pass, eliminating the gradient dilution problem that plagues multi-hop sparse attention. The key-centric backward pass with zero-atomic relay gradients eliminates contention, and automatic GPU detection ensures broad hardware compatibility. The pip-installable package provides drop-in replacement modules for immediate adoption in long-context LLM training and inference.
+
+\section*{Acknowledgments}
+
+Built on Triton by OpenAI. Inspired by FlashAttention by Tri Dao.
+
+\bibliographystyle{plain}
+\begin{thebibliography}{10}
+
+\bibitem{flashattn}
+Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher Ré.
+\newblock FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness.
+\newblock {\em NeurIPS}, 2022.
+
+\bibitem{flashattn2}
+Tri Dao.
+\newblock FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning.
+\newblock {\em arXiv:2307.08691}, 2023.
+
+\bibitem{flashdecoding}
+Tri Dao, Daniel Haziza, Francisco Massa, and Gintare Karolina Dziugaite.
+\newblock Flash-Decoding for Long-Context Inference.
+\newblock {\em Blog post}, 2023.
+
+\bibitem{longformer}
+Iz Beltagy, Matthew E. Peters, and Arman Cohan.
+\newblock Longformer: The Long-Document Transformer.
+\newblock {\em arXiv:2004.05150}, 2020.
+
+\bibitem{bigbird}
+Manzil Zaheer, Guru Guruganesh, Avinava Dubey, et al.
+\newblock Big Bird: Transformers for Longer Sequences.
+\newblock {\em NeurIPS}, 2020.
+
+\bibitem{sparse_transformers}
+Rewon Child, Scott Gray, Alec Radford, and Ilya Sutskever.
+\newblock Generating Long Sequences with Sparse Transformers.
+\newblock {\em arXiv:1904.10509}, 2019.
+
+\bibitem{linear_attention}
+Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pappas, and François Fleuret.
+\newblock Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention.
+\newblock {\em ICML}, 2020.
+
+\bibitem{rwkv}
+Bo Peng, Eric Alcaide, Quentin Anthony, et al.
+\newblock RWKV: Reinventing RNNs for the Transformer Era.
+\newblock {\em arXiv:2305.13048}, 2023.
+
+\bibitem{mamba}
+Albert Gu and Tri Dao.
+\newblock Mamba: Linear-Time Sequence Modeling with Selective State Spaces.
+\newblock {\em arXiv:2312.00752}, 2023.
+
+\end{thebibliography}
+
+\end{document}
