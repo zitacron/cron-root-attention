@@ -1,4 +1,4 @@
-# Cron Root Attention™
+<img width="1647" height="1374" alt="image" src="https://github.com/user-attachments/assets/070df42c-376f-45b4-806f-80068d6116d9" /># Cron Root Attention™
 
 **Sub-quadratic O(N√N) attention with 2-hop relay for long-context transformers**
 
@@ -144,6 +144,20 @@ Query at position 100 (√N = 23, S = 512):
 ### 2-Hop Relay Mechanism
 
 The relay mechanism solves the **gradient dilution problem** inherent in multi-hop sparse attention. Without relay, 2-hop information must survive two separate softmax normalizations across layers — gradients wash out exponentially.
+
+### Mathematical explanation
+"If its sub quadratic compexity, then why isn't it faster than SDPA(Flash) at smaller sequences?"
+
+This is because the more your complexity converges to a linear complexity, the less efficient it is despite being scalable.
+Here is an image showing how sequence length (x axis) scales with time (y axis) as it increases
+<img width="2726" height="1007" alt="image" src="https://github.com/user-attachments/assets/07f66ac5-a776-4834-ab99-08d7df548d00"/>
+
+This image shows that our N√N complexity IS working as intended, making it scalable as sequence length increases, but what about smaller sequences?
+
+<img width="1647" height="1374" alt="image" src="https://github.com/user-attachments/assets/fbf5b8cf-7355-4c01-a74b-3da6fb13e878" />
+
+So desipite the speedup at longer sequences, there is still a slight overhead for calculating the √ of the sequence. This essentially means we are trading compute for memory, yet compute is so low the net gain is positive.
+
 
 **Relay solves this by carrying compressed 2-hop information through a single softmax:**
 
