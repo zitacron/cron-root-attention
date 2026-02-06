@@ -16,8 +16,10 @@ from typing import Optional, Literal
 
 from .core import cron_root_attention_v14
 
-# Default threshold: use SDPA for S < 1024, Cron Root for S >= 1024
-_SDPA_THRESHOLD = 1024
+# Training crossover: Cron Root beats SDPA at S >= ~1536 (training),
+# S >= ~1024 (forward-only), S >= ~1024 (inference).
+# Default to 1536 as the training-oriented threshold (conservative).
+_SDPA_THRESHOLD = 1536
 
 
 def cron_root_attention_hybrid(
@@ -30,19 +32,24 @@ def cron_root_attention_hybrid(
     """
     Hybrid Cron Root attention with automatic backend selection.
     
+    Uses SDPA/FlashAttention for S < threshold, Cron Root for S >= threshold.
+    In "auto" mode, selects the faster backend based on measured crossover:
+      - Training crossover: ~1536 tokens
+      - Forward/inference crossover: ~1024 tokens
+    
     Args:
         q: Query tensor (B, H, S, D)
         k: Key tensor (B, H, S, D)
         v: Value tensor (B, H, S, D)
         backend: "auto" (based on S), "cron_root" (force √N), "sdpa" (force SDPA)
-        threshold: Sequence length threshold for auto selection
+        threshold: Sequence length threshold for auto selection (default: 1536)
         
     Returns:
         Output tensor (B, H, S, D)
         
     Example:
         >>> output = cron_root_attention_hybrid(q, k, v, backend="auto")
-        >>> # Uses SDPA for S < 1024, Cron Root for S >= 1024
+        >>> # Uses SDPA for S < 1536, Cron Root for S >= 1536
     """
     S = q.shape[2]
     

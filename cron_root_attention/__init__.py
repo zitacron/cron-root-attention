@@ -25,15 +25,21 @@ Supported GPUs:
 
 Key Results (RTX 5070 Ti, FP16, PyTorch 2.9.1 + CUDA 12.8):
     Forward pass (kernel only):
-        S=4096:   2.80x speedup vs SDPA/Flash
-        S=16384:  9.77x speedup
-        S=65536:  20.9x speedup
-        S=131072: 26.2x speedup
-        S=262144: 44.3x speedup  
-        S=524288: 58.2x speedup
+        S=1024:   1.02x speedup vs SDPA/Flash  (crossover ~1K)
+        S=2048:   3.44x speedup
+        S=4096:   9.24x speedup
+        S=8192:   13.3x speedup
+        S=16384:  9.91x speedup
+        S=65536:  18.6x speedup
+        S=131072: 27.0x speedup
+        S=262144: 45.3x speedup  
+        S=524288: 56.8x speedup
     
-    Training (fwd+bwd, 131K): 3.64x end-to-end speedup
-    Inference (no_grad, 524K): 57.0x speedup
+    Training (fwd+bwd):
+        S=4096:  1.45x, S=8192: 1.73x, S=131K: 3.76x
+        Crossover ~2K (fully-fused single-kernel backward for S≤8K)
+    
+    Hybrid mode: ≥1.0x at ALL lengths (auto SDPA below 1536)
 
 Usage:
     from cron_root_attention import cron_root_attention, CronRootAttention

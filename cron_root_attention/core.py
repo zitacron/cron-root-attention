@@ -934,6 +934,178 @@ def _cron_root_attn_bwd_dq_fused_v14(
 
 
 # =============================================================================
+# FULLY FUSED SINGLE-KERNEL BACKWARD (for short sequences)
+# =============================================================================
+# Computes dQ + local dK/dV + strided dK/dV in ONE kernel launch.
+# This eliminates ALL kernel launch overhead for the backward pass.
+# Uses atomic_add for ALL dK/dV contributions (low contention at short seqs).
+# Requires dk/dv initialized to zero.
+
+@triton.jit
+def _cron_root_attn_bwd_fully_fused(
+    Q, K, V, O, dO, dQ, dK, dV, L,
+    stride_qb, stride_qh, stride_qm, stride_qd,
+    stride_kb, stride_kh, stride_kn, stride_kd,
+    stride_vb, stride_vh, stride_vn, stride_vd,
+    stride_ob, stride_oh, stride_om, stride_od,
+    stride_dob, stride_doh, stride_dom, stride_dod,
+    stride_dqb, stride_dqh, stride_dqm, stride_dqd,
+    stride_dkb, stride_dkh, stride_dkn, stride_dkd,
+    stride_dvb, stride_dvh, stride_dvn, stride_dvd,
+    stride_lb, stride_lh, stride_lm,
+    S: tl.constexpr, D: tl.constexpr, SQRT_N: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
+    BLOCK_LOCAL: tl.constexpr, BLOCK_STRIDE: tl.constexpr,
+):
+    """
+    FULLY FUSED Backward: dQ + local dK/dV + strided dK/dV in ONE kernel.
+    
+    Query-centric: one block per (B, H, query_tile).
+    - Phase 1: Local window → dQ contribution + local dK/dV via atomic_add
+    - Phase 2: Strided keys → dQ contribution + strided dK/dV via atomic_add
+    
+    At short sequences (S ≤ 4096), atomic contention is minimal:
+    - Each local key gets atomic_adds from ≤2 query tiles
+    - Each strided key gets atomic_adds from all query tiles, but there
+      are only O(√N) strided keys
+    
+    Eliminates separate local and strided backward kernels entirely.
+    Requires dK/dV initialized to zeros.
+    """
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    tile_m = tl.program_id(2)
+    
+    m_start = tile_m * BLOCK_M
+    m_offsets = m_start + tl.arange(0, BLOCK_M)
+    m_mask = m_offsets < S
+    
+    d_idx = tl.arange(0, BLOCK_D)
+    
+    # Load Q, O, dO, LSE
+    q_ptr = Q + b * stride_qb + h * stride_qh
+    q = tl.load(q_ptr + m_offsets[:, None] * stride_qm + d_idx[None, :] * stride_qd,
+                mask=m_mask[:, None] & (d_idx[None, :] < D), other=0.0)
+    
+    o_ptr = O + b * stride_ob + h * stride_oh
+    o = tl.load(o_ptr + m_offsets[:, None] * stride_om + d_idx[None, :] * stride_od,
+                mask=m_mask[:, None] & (d_idx[None, :] < D), other=0.0)
+    
+    do_ptr = dO + b * stride_dob + h * stride_doh
+    do = tl.load(do_ptr + m_offsets[:, None] * stride_dom + d_idx[None, :] * stride_dod,
+                 mask=m_mask[:, None] & (d_idx[None, :] < D), other=0.0)
+    
+    l_ptr = L + b * stride_lb + h * stride_lh
+    lse = tl.load(l_ptr + m_offsets * stride_lm, mask=m_mask, other=0.0)
+    
+    scale = 1.0 / tl.sqrt(tl.cast(D, tl.float32))
+    Di = tl.sum(o * do, axis=1)
+    
+    dq_acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+    
+    # =================================================================
+    # PHASE 1: Local window — dQ + local dK/dV (atomic)
+    # =================================================================
+    window_start = m_start - SQRT_N + 1
+    window_start = tl.maximum(window_start, 0)
+    window_end = m_start + BLOCK_M - 1
+    window_end = tl.minimum(window_end, S - 1)
+    
+    for n in range(0, SQRT_N + BLOCK_M, BLOCK_LOCAL):
+        n_offsets = window_start + n + tl.arange(0, BLOCK_LOCAL)
+        n_mask = (n_offsets >= 0) & (n_offsets <= window_end) & (n_offsets < S)
+        
+        k_ptr = K + b * stride_kb + h * stride_kh
+        k = tl.load(k_ptr + n_offsets[:, None] * stride_kn + d_idx[None, :] * stride_kd,
+                    mask=n_mask[:, None] & (d_idx[None, :] < D), other=0.0)
+        
+        v_ptr = V + b * stride_vb + h * stride_vh
+        v = tl.load(v_ptr + n_offsets[:, None] * stride_vn + d_idx[None, :] * stride_vd,
+                    mask=n_mask[:, None] & (d_idx[None, :] < D), other=0.0)
+        
+        # Scores: [BLOCK_M, BLOCK_LOCAL]
+        scores = tl.dot(q, tl.trans(k)) * scale
+        causal_mask = (n_offsets[None, :] <= m_offsets[:, None]) & \
+                      (n_offsets[None, :] >= m_offsets[:, None] - SQRT_N + 1)
+        full_mask = causal_mask & n_mask[None, :] & m_mask[:, None]
+        scores = tl.where(full_mask, scores, float('-inf'))
+        
+        # Attention probabilities and gradient
+        p = tl.exp(scores - lse[:, None])
+        dov = tl.dot(do, tl.trans(v))
+        dp = p * (dov - Di[:, None])
+        dp = tl.where(full_mask, dp, 0.0)
+        
+        # dQ accumulation
+        dq_acc += tl.dot(dp.to(k.dtype), k) * scale
+        
+        # FUSED: local dK/dV via atomic_add
+        # dk_contrib: [BLOCK_LOCAL, D] = dp^T @ q * scale
+        # dv_contrib: [BLOCK_LOCAL, D] = p^T @ do
+        dk_contrib = tl.dot(tl.trans(dp.to(q.dtype)), q) * scale
+        dv_contrib = tl.dot(tl.trans(p.to(do.dtype)), do)
+        
+        # Atomic add to dK/dV — low contention: each key touched by ≤2 query tiles
+        dk_base = dK + b * stride_dkb + h * stride_dkh
+        dv_base = dV + b * stride_dvb + h * stride_dvh
+        tl.atomic_add(
+            dk_base + n_offsets[:, None] * stride_dkn + d_idx[None, :] * stride_dkd,
+            dk_contrib.to(dK.dtype.element_ty),
+            mask=n_mask[:, None] & (d_idx[None, :] < D)
+        )
+        tl.atomic_add(
+            dv_base + n_offsets[:, None] * stride_dvn + d_idx[None, :] * stride_dvd,
+            dv_contrib.to(dV.dtype.element_ty),
+            mask=n_mask[:, None] & (d_idx[None, :] < D)
+        )
+    
+    # =================================================================
+    # PHASE 2: Strided keys — dQ + strided dK/dV (atomic)
+    # =================================================================
+    local_starts = tl.maximum(m_offsets - SQRT_N + 1, 0)
+    max_m = m_start + BLOCK_M - 1
+    max_local_start = tl.maximum(max_m - SQRT_N + 1, 0)
+    max_num_strided = (max_local_start + SQRT_N - 1) // SQRT_N
+    
+    for s_idx in range(max_num_strided):
+        k_pos = s_idx * SQRT_N
+        
+        if k_pos < S:
+            k_ptr = K + b * stride_kb + h * stride_kh
+            key = tl.load(k_ptr + k_pos * stride_kn + d_idx * stride_kd,
+                          mask=d_idx < D, other=0.0)
+            
+            v_ptr = V + b * stride_vb + h * stride_vh
+            val = tl.load(v_ptr + k_pos * stride_vn + d_idx * stride_vd,
+                          mask=d_idx < D, other=0.0)
+            
+            scores = tl.sum(q * key[None, :], axis=1) * scale
+            strided_mask = (k_pos < local_starts) & m_mask
+            scores = tl.where(strided_mask, scores, float('-inf'))
+            
+            p = tl.exp(scores - lse)
+            dov = tl.sum(do * val[None, :], axis=1)
+            dp = p * (dov - Di)
+            dp = tl.where(strided_mask, dp, 0.0)
+            
+            dq_acc += dp[:, None] * key[None, :] * scale
+            
+            dk_contrib = tl.sum(dp[:, None] * q, axis=0) * scale
+            dv_contrib = tl.sum(p[:, None] * do, axis=0)
+            
+            dk_ptr = dK + b * stride_dkb + h * stride_dkh + k_pos * stride_dkn
+            dv_ptr = dV + b * stride_dvb + h * stride_dvh + k_pos * stride_dvn
+            tl.atomic_add(dk_ptr + d_idx * stride_dkd, dk_contrib.to(dK.dtype.element_ty), mask=d_idx < D)
+            tl.atomic_add(dv_ptr + d_idx * stride_dvd, dv_contrib.to(dV.dtype.element_ty), mask=d_idx < D)
+    
+    # Store dQ (direct store — each query tile owns its dQ positions)
+    dq_ptr = dQ + b * stride_dqb + h * stride_dqh
+    tl.store(dq_ptr + m_offsets[:, None] * stride_dqm + d_idx[None, :] * stride_dqd,
+             dq_acc.to(dQ.dtype.element_ty),
+             mask=m_mask[:, None] & (d_idx[None, :] < D))
+
+
+# =============================================================================
 # OPTIMIZED dK/dV KERNELS (O(N√N) complexity)
 # =============================================================================
 # Split into two phases:
@@ -1575,6 +1747,15 @@ def _dkdv_relay_v14(
 class CronRootAttentionV14Function(torch.autograd.Function):
     """Autograd function for V14 tiled √N attention with 2-hop relay."""
     
+    # Relay skip threshold: below this, strided-only provides sufficient
+    # global coverage and we avoid relay precompute + backward overhead.
+    # This eliminates ~8 CUDA operations from the backward pass.
+    RELAY_THRESHOLD = 8192
+    
+    # Fused backward threshold: below this, use single-kernel backward
+    # (fully fused dQ + local dK/dV + strided dK/dV) instead of 4-kernel approach.
+    FUSED_BWD_THRESHOLD = 8192
+    
     @staticmethod
     def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                 use_persistent: bool = False) -> torch.Tensor:
@@ -1589,30 +1770,35 @@ class CronRootAttentionV14Function(torch.autograd.Function):
         BLOCK_RELAY = 16  # Relay blocks per iteration
         
         # =====================================================================
-        # PRE-COMPUTE RELAY KEYS/VALUES (2-hop block-mean aggregation)
+        # RELAY SKIP: For short sequences, strided positions alone provide
+        # O(√N) global coverage. Relay adds overhead but marginal value.
+        # Skipping eliminates: pad + reshape + mean + contiguous (2-4 CUDA ops)
         # =====================================================================
-        # relay_k[r] = mean(K[r*SQRT_N : (r+1)*SQRT_N]), shape: (B, H, NUM_RELAY, D)
-        NUM_RELAY = (S + SQRT_N - 1) // SQRT_N
-        pad_len = NUM_RELAY * SQRT_N - S
-        if pad_len > 0:
-            k_padded = torch.nn.functional.pad(k, (0, 0, 0, pad_len))
-            v_padded = torch.nn.functional.pad(v, (0, 0, 0, pad_len))
+        skip_relay = (S <= CronRootAttentionV14Function.RELAY_THRESHOLD)
+        
+        if skip_relay:
+            NUM_RELAY = 0
+            # Dummy relay buffers (never accessed since NUM_RELAY=0)
+            relay_k = torch.empty(B, H, 1, D, device=q.device, dtype=q.dtype)
+            relay_v = torch.empty(B, H, 1, D, device=q.device, dtype=q.dtype)
         else:
-            k_padded = k
-            v_padded = v
-        # Reshape: (B, H, NUM_RELAY, SQRT_N, D) -> mean over dim 3
-        relay_k = k_padded.reshape(B, H, NUM_RELAY, SQRT_N, D).mean(dim=3).contiguous()
-        relay_v = v_padded.reshape(B, H, NUM_RELAY, SQRT_N, D).mean(dim=3).contiguous()
+            # Full relay pre-computation
+            NUM_RELAY = (S + SQRT_N - 1) // SQRT_N
+            pad_len = NUM_RELAY * SQRT_N - S
+            if pad_len > 0:
+                k_padded = torch.nn.functional.pad(k, (0, 0, 0, pad_len))
+                v_padded = torch.nn.functional.pad(v, (0, 0, 0, pad_len))
+            else:
+                k_padded = k
+                v_padded = v
+            relay_k = k_padded.reshape(B, H, NUM_RELAY, SQRT_N, D).mean(dim=3).contiguous()
+            relay_v = v_padded.reshape(B, H, NUM_RELAY, SQRT_N, D).mean(dim=3).contiguous()
         
         # Allocate outputs
         o = torch.empty_like(q)
         L = torch.empty(B, H, S, dtype=torch.float32, device=q.device)
         
-        if use_persistent:
-            # NOTE: Persistent kernel is currently disabled
-            pass
-        
-        # Standard tiled kernel path (always used)
+        # Standard tiled kernel path
         num_tiles = (S + BLOCK_M - 1) // BLOCK_M
         
         _cron_root_attn_fwd_v14_tiled[(B, H, num_tiles)](
@@ -1634,6 +1820,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
         ctx.save_for_backward(q, k, v, o, L, relay_k, relay_v)
         ctx.SQRT_N = SQRT_N
         ctx.NUM_RELAY = NUM_RELAY
+        ctx.skip_relay = skip_relay
         ctx.BLOCK_M = BLOCK_M
         ctx.BLOCK_D = BLOCK_D
         ctx.BLOCK_LOCAL = BLOCK_LOCAL
@@ -1648,67 +1835,82 @@ class CronRootAttentionV14Function(torch.autograd.Function):
         B, H, S, D = q.shape
         SQRT_N = ctx.SQRT_N
         NUM_RELAY = ctx.NUM_RELAY
+        skip_relay = ctx.skip_relay
         BLOCK_M = ctx.BLOCK_M
         BLOCK_D = ctx.BLOCK_D
         BLOCK_LOCAL = ctx.BLOCK_LOCAL
         BLOCK_STRIDE = ctx.BLOCK_STRIDE
         BLOCK_RELAY = ctx.BLOCK_RELAY
         
-        dq = torch.empty_like(q)
-        dk = torch.zeros_like(k)  # Zero for atomic accumulation
-        dv = torch.zeros_like(v)  # Zero for atomic accumulation
+        use_fused_bwd = (S <= CronRootAttentionV14Function.FUSED_BWD_THRESHOLD)
         
-        # =================================================================
-        # dQ-ONLY KERNEL (includes relay Phase 3 contribution to dQ)
-        # =================================================================
-        num_tiles_m = (S + BLOCK_M - 1) // BLOCK_M
-        _cron_root_attn_bwd_dq_only_v14[(B, H, num_tiles_m)](
-            q, k, v, o, do, dq, L,
-            relay_k, relay_v,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-            do.stride(0), do.stride(1), do.stride(2), do.stride(3),
-            dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
-            L.stride(0), L.stride(1), L.stride(2),
-            relay_k.stride(0), relay_k.stride(1), relay_k.stride(2), relay_k.stride(3),
-            relay_v.stride(0), relay_v.stride(1), relay_v.stride(2), relay_v.stride(3),
-            S=S, D=D, SQRT_N=SQRT_N,
-            NUM_RELAY=NUM_RELAY, BLOCK_RELAY=BLOCK_RELAY,
-            BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
-            BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
-        )
-        
-        # =================================================================
-        # LOCAL dK/dV - O(N√N) complexity
-        # =================================================================
-        BLOCK_N = 32  # Keys per tile
-        BLOCK_Q = 32  # Queries per iteration
-        num_tiles_n = (S + BLOCK_N - 1) // BLOCK_N
-        
-        _dkdv_local_phase[(B, H, num_tiles_n)](
-            q, k, v, o, do, dk, dv, L,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-            do.stride(0), do.stride(1), do.stride(2), do.stride(3),
-            dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
-            dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
-            L.stride(0), L.stride(1), L.stride(2),
-            S=S, D=D, SQRT_N=SQRT_N,
-            BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, BLOCK_Q=BLOCK_Q,
-        )
-        
-        # =================================================================
-        # KEY-CENTRIC STRIDED dK/dV - ZERO ATOMICS!
-        # =================================================================
-        num_strided_keys = (S + SQRT_N - 1) // SQRT_N
-        BLOCK_Q_STRIDED = 64
-        
-        if num_strided_keys > 0:
-            _dkdv_strided_key_centric[(num_strided_keys, B, H)](
+        if use_fused_bwd and skip_relay:
+            # =============================================================
+            # OPTIMIZED SINGLE-KERNEL BACKWARD (relay-skip + fully fused)
+            # =============================================================
+            # ONE kernel: dQ + local dK/dV + strided dK/dV
+            # Eliminates: relay precompute, relay backward, relay scatter,
+            #   ALL separate backward kernels
+            # Total: 1 kernel instead of 4 + relay ops
+            # =============================================================
+            
+            dq = torch.empty_like(q)
+            dk = torch.zeros_like(k)  # Zeros needed: fully-fused uses atomics for all dK/dV
+            dv = torch.zeros_like(v)
+            
+            num_tiles_m = (S + BLOCK_M - 1) // BLOCK_M
+            
+            _cron_root_attn_bwd_fully_fused[(B, H, num_tiles_m)](
+                q, k, v, o, do, dq, dk, dv, L,
+                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+                k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+                v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+                o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+                do.stride(0), do.stride(1), do.stride(2), do.stride(3),
+                dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
+                dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
+                dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
+                L.stride(0), L.stride(1), L.stride(2),
+                S=S, D=D, SQRT_N=SQRT_N,
+                BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
+                BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
+            )
+            
+            # No relay scatter needed — skip_relay=True
+        else:
+            # =============================================================
+            # STANDARD 4-KERNEL BACKWARD (with relay)
+            # =============================================================
+            dq = torch.empty_like(q)
+            dk = torch.zeros_like(k)  # Zero for atomic accumulation
+            dv = torch.zeros_like(v)  # Zero for atomic accumulation
+            
+            # dQ-ONLY KERNEL (includes relay Phase 3 contribution to dQ)
+            num_tiles_m = (S + BLOCK_M - 1) // BLOCK_M
+            _cron_root_attn_bwd_dq_only_v14[(B, H, num_tiles_m)](
+                q, k, v, o, do, dq, L,
+                relay_k, relay_v,
+                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+                k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+                v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+                o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+                do.stride(0), do.stride(1), do.stride(2), do.stride(3),
+                dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
+                L.stride(0), L.stride(1), L.stride(2),
+                relay_k.stride(0), relay_k.stride(1), relay_k.stride(2), relay_k.stride(3),
+                relay_v.stride(0), relay_v.stride(1), relay_v.stride(2), relay_v.stride(3),
+                S=S, D=D, SQRT_N=SQRT_N,
+                NUM_RELAY=NUM_RELAY, BLOCK_RELAY=BLOCK_RELAY,
+                BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
+                BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
+            )
+            
+            # LOCAL dK/dV - O(N√N) complexity
+            BLOCK_N = 32
+            BLOCK_Q = 32
+            num_tiles_n = (S + BLOCK_N - 1) // BLOCK_N
+            
+            _dkdv_local_phase[(B, H, num_tiles_n)](
                 q, k, v, o, do, dk, dv, L,
                 q.stride(0), q.stride(1), q.stride(2), q.stride(3),
                 k.stride(0), k.stride(1), k.stride(2), k.stride(3),
@@ -1719,46 +1921,57 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                 dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
                 L.stride(0), L.stride(1), L.stride(2),
                 S=S, D=D, SQRT_N=SQRT_N,
-                BLOCK_Q=BLOCK_Q_STRIDED, BLOCK_D=BLOCK_D,
+                BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, BLOCK_Q=BLOCK_Q,
             )
-        
-        # =================================================================
-        # RELAY dK/dV - 2-hop backward (ZERO ATOMICS, exclusive ownership)
-        # =================================================================
-        d_relay_k = torch.zeros_like(relay_k)
-        d_relay_v = torch.zeros_like(relay_v)
-        BLOCK_Q_RELAY = 64
-        
-        if NUM_RELAY > 0:
-            _dkdv_relay_v14[(NUM_RELAY, B, H)](
-                q, relay_k, relay_v, o, do, d_relay_k, d_relay_v, L,
-                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-                relay_k.stride(0), relay_k.stride(1), relay_k.stride(2), relay_k.stride(3),
-                relay_v.stride(0), relay_v.stride(1), relay_v.stride(2), relay_v.stride(3),
-                o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-                do.stride(0), do.stride(1), do.stride(2), do.stride(3),
-                d_relay_k.stride(0), d_relay_k.stride(1), d_relay_k.stride(2), d_relay_k.stride(3),
-                d_relay_v.stride(0), d_relay_v.stride(1), d_relay_v.stride(2), d_relay_v.stride(3),
-                L.stride(0), L.stride(1), L.stride(2),
-                S=S, D=D, SQRT_N=SQRT_N,
-                NUM_RELAY=NUM_RELAY,
-                BLOCK_Q=BLOCK_Q_RELAY, BLOCK_D=BLOCK_D,
-            )
-        
-        # =================================================================
-        # SCATTER RELAY GRADIENTS BACK TO dK, dV
-        # relay_k[r] = mean(K[r*SQRT_N : (r+1)*SQRT_N])
-        # Chain rule: dK[r*SQRT_N + i] += d_relay_k[r] / SQRT_N
-        # =================================================================
-        # Expand d_relay to match block structure and scatter
-        # d_relay_k: (B, H, NUM_RELAY, D) -> (B, H, NUM_RELAY, SQRT_N, D) -> (B, H, NUM_RELAY*SQRT_N, D)
-        d_relay_k_expanded = (d_relay_k / SQRT_N).unsqueeze(3).expand(B, H, NUM_RELAY, SQRT_N, D)
-        d_relay_k_expanded = d_relay_k_expanded.reshape(B, H, NUM_RELAY * SQRT_N, D)
-        dk[:, :, :S, :] += d_relay_k_expanded[:, :, :S, :]
-        
-        d_relay_v_expanded = (d_relay_v / SQRT_N).unsqueeze(3).expand(B, H, NUM_RELAY, SQRT_N, D)
-        d_relay_v_expanded = d_relay_v_expanded.reshape(B, H, NUM_RELAY * SQRT_N, D)
-        dv[:, :, :S, :] += d_relay_v_expanded[:, :, :S, :]
+            
+            # KEY-CENTRIC STRIDED dK/dV
+            num_strided_keys = (S + SQRT_N - 1) // SQRT_N
+            BLOCK_Q_STRIDED = 64
+            
+            if num_strided_keys > 0:
+                _dkdv_strided_key_centric[(num_strided_keys, B, H)](
+                    q, k, v, o, do, dk, dv, L,
+                    q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+                    k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+                    v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+                    o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+                    do.stride(0), do.stride(1), do.stride(2), do.stride(3),
+                    dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
+                    dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
+                    L.stride(0), L.stride(1), L.stride(2),
+                    S=S, D=D, SQRT_N=SQRT_N,
+                    BLOCK_Q=BLOCK_Q_STRIDED, BLOCK_D=BLOCK_D,
+                )
+            
+            # RELAY dK/dV (only when relay was used)
+            if NUM_RELAY > 0 and not skip_relay:
+                d_relay_k = torch.zeros_like(relay_k)
+                d_relay_v = torch.zeros_like(relay_v)
+                BLOCK_Q_RELAY = 64
+                
+                _dkdv_relay_v14[(NUM_RELAY, B, H)](
+                    q, relay_k, relay_v, o, do, d_relay_k, d_relay_v, L,
+                    q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+                    relay_k.stride(0), relay_k.stride(1), relay_k.stride(2), relay_k.stride(3),
+                    relay_v.stride(0), relay_v.stride(1), relay_v.stride(2), relay_v.stride(3),
+                    o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+                    do.stride(0), do.stride(1), do.stride(2), do.stride(3),
+                    d_relay_k.stride(0), d_relay_k.stride(1), d_relay_k.stride(2), d_relay_k.stride(3),
+                    d_relay_v.stride(0), d_relay_v.stride(1), d_relay_v.stride(2), d_relay_v.stride(3),
+                    L.stride(0), L.stride(1), L.stride(2),
+                    S=S, D=D, SQRT_N=SQRT_N,
+                    NUM_RELAY=NUM_RELAY,
+                    BLOCK_Q=BLOCK_Q_RELAY, BLOCK_D=BLOCK_D,
+                )
+                
+                # SCATTER RELAY GRADIENTS BACK TO dK, dV
+                d_relay_k_expanded = (d_relay_k / SQRT_N).unsqueeze(3).expand(B, H, NUM_RELAY, SQRT_N, D)
+                d_relay_k_expanded = d_relay_k_expanded.reshape(B, H, NUM_RELAY * SQRT_N, D)
+                dk[:, :, :S, :] += d_relay_k_expanded[:, :, :S, :]
+                
+                d_relay_v_expanded = (d_relay_v / SQRT_N).unsqueeze(3).expand(B, H, NUM_RELAY, SQRT_N, D)
+                d_relay_v_expanded = d_relay_v_expanded.reshape(B, H, NUM_RELAY * SQRT_N, D)
+                dv[:, :, :S, :] += d_relay_v_expanded[:, :, :S, :]
         
         return dq, dk, dv, None
 
