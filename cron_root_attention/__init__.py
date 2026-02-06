@@ -3,7 +3,7 @@ Cron Root Attention - Sub-quadratic Attention for Long-Context Transformers
 ============================================================================
 
 A high-performance Triton implementation of √N sparse attention achieving
-O(N√N) complexity instead of O(N²), enabling up to 202x kernel speedups at
+O(N√N) complexity instead of O(N²), enabling up to 57x kernel speedups at
 long sequence lengths.
 
 (c) 2026 Zitacron. All rights reserved.
