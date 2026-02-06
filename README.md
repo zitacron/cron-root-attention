@@ -158,6 +158,9 @@ This image shows that our N√N complexity IS working as intended, making it sca
 
 So desipite the speedup at longer sequences, there is still a slight overhead for calculating the √ of the sequence. This essentially means we are trading compute for memory, yet compute is so low the net gain is positive.
 
+"What is the point of dealing with smaller sequence lengths if AI's need **bigger** context lengths?"
+
+There are use cases for **Encoders** will often have a hard limit of 512 tokens for an input. These include BERT (search engine) RoBERTa (high accuracy text classification) and more. So despite the insane 56.8x speedup cron root attention provides, it is still limited by kernal launch overhead and its own mathematical complexity. 
 
 **Relay solves this by carrying compressed 2-hop information through a single softmax:**
 
