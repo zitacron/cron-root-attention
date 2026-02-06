@@ -1,4 +1,4 @@
-<img width="1647" height="1374" alt="image" src="https://github.com/user-attachments/assets/070df42c-376f-45b4-806f-80068d6116d9" /># Cron Root Attention™
+# Cron Root Attention™
 
 **Sub-quadratic O(N√N) attention with 2-hop relay for long-context transformers**
 
