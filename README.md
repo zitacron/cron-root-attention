@@ -8,25 +8,89 @@
 
 ## Key Results
 
-Cron Root Attention achieves **up to 57x forward kernel speedup** over SDPA/FlashAttention-2 at long sequence lengths by reducing attention complexity from O(N²) to O(N√N), with **100% token coverage** through a 3-phase relay mechanism. Forward crossover is **~1K tokens**, training crossover is **~2K tokens**. The **hybrid mode** auto-selects SDPA below crossover for zero-regression deployment.
+Cron Root Attention achieves **up to 68x forward kernel speedup** over SDPA/FlashAttention-2 at long sequence lengths by reducing attention complexity from O(N²) to O(N√N), with **100% token coverage** through a 3-phase relay mechanism. Forward crossover varies by model size — as few as **512 tokens** for larger heads. The **hybrid mode** auto-selects SDPA below crossover for zero-regression deployment.
 
-### Forward Pass Benchmarks (Kernel Only)
+All benchmarks below were measured on **RTX 5070 Ti** (Blackwell GB203, 70 SMs), PyTorch 2.9.1, CUDA 12.8, FP16. Timing uses CUDA events with verified warmup (adaptive 20–50 warmup iterations + stability check with CV < 5% before measurement, trimmed mean of 10–100 measured repeats).
+
+### Forward Pass — Multiple Model Configurations
+
+Speedup scales with both sequence length and model size. Larger head dimensions benefit more from sub-quadratic scaling.
+
+#### Small Model (H=8, D=64 — 512-dim, 8-head)
 
 | Sequence Length | Cron Root | SDPA (Flash) | Speedup |
 |-----------------|-----------|--------------|----------|
-| 512 | 0.031ms | 0.017ms | 0.53x |
-| 1,024 | 0.030ms | 0.031ms | **1.02x** |
-| 2,048 | 0.032ms | 0.109ms | **3.44x** |
-| 4,096 | 0.032ms | 0.295ms | **9.24x** |
-| 8,192 | 0.072ms | 0.966ms | **13.3x** |
-| 16,384 | 0.335ms | 3.32ms | **9.91x** |
-| 32,768 | 1.19ms | 12.8ms | **10.8x** |
-| 65,536 | 2.68ms | 49.7ms | **18.6x** |
-| 131,072 | 7.28ms | 197ms | **27.0x** |
-| 262,144 | 17.0ms | 772ms | **45.3x** |
-| 524,288 | 54.4ms | 3089ms | **56.8x** |
+| 512 | 0.040ms | 0.023ms | 0.59x |
+| 1,024 | 0.042ms | 0.036ms | 0.87x |
+| 2,048 | 0.048ms | 0.110ms | **2.31x** |
+| 4,096 | 0.061ms | 0.289ms | **4.76x** |
+| 8,192 | 0.102ms | 0.918ms | **8.96x** |
+| 16,384 | 0.339ms | 3.34ms | **9.86x** |
+| 32,768 | 1.17ms | 13.1ms | **11.3x** |
+| 65,536 | 2.35ms | 48.4ms | **20.6x** |
+| 131,072 | 7.33ms | 192ms | **26.2x** |
+| 262,144 | 17.3ms | 762ms | **44.1x** |
+| 524,288 | 52.1ms | 3042ms | **58.4x** |
 
-*Measured on RTX 5070 Ti (Blackwell GB203), PyTorch 2.9.1, CUDA 12.8, FP16, B=1, H=8, D=64. CUDA event timing, trimmed mean of 30+ runs.*
+#### Medium Model (H=12, D=64 — 768-dim, 12-head)
+
+| Sequence Length | Cron Root | SDPA (Flash) | Speedup |
+|-----------------|-----------|--------------|----------|
+| 512 | 0.040ms | 0.023ms | 0.59x |
+| 1,024 | 0.041ms | 0.054ms | **1.31x** |
+| 2,048 | 0.052ms | 0.134ms | **2.57x** |
+| 4,096 | 0.075ms | 0.389ms | **5.19x** |
+| 8,192 | 0.138ms | 1.30ms | **9.48x** |
+| 16,384 | 0.511ms | 4.81ms | **9.41x** |
+| 32,768 | 1.74ms | 18.4ms | **10.6x** |
+| 65,536 | 3.48ms | 72.1ms | **20.8x** |
+| 131,072 | 11.2ms | 287ms | **25.6x** |
+| 262,144 | 26.0ms | 1141ms | **44.0x** |
+| 524,288 | 78.4ms | 4559ms | **58.2x** |
+
+#### Large Model (H=16, D=128 — 2048-dim, 16-head)
+
+| Sequence Length | Cron Root | SDPA (Flash) | Speedup |
+|-----------------|-----------|--------------|----------|
+| 512 | 0.043ms | 0.036ms | 0.84x |
+| 1,024 | 0.053ms | 0.102ms | **1.92x** |
+| 2,048 | 0.081ms | 0.285ms | **3.52x** |
+| 4,096 | 0.140ms | 0.958ms | **6.87x** |
+| 8,192 | 0.303ms | 3.45ms | **11.4x** |
+| 16,384 | 1.25ms | 13.2ms | **10.5x** |
+| 32,768 | 4.38ms | 51.6ms | **11.8x** |
+| 65,536 | 8.44ms | 204ms | **24.2x** |
+| 131,072 | 27.6ms | 813ms | **29.4x** |
+| 262,144 | 62.2ms | 3251ms | **52.3x** |
+| 524,288 | 191ms | 12944ms | **67.8x** |
+
+#### XL Model (H=32, D=128 — 4096-dim, 32-head)
+
+| Sequence Length | Cron Root | SDPA (Flash) | Speedup |
+|-----------------|-----------|--------------|----------|
+| 512 | 0.052ms | 0.060ms | **1.17x** |
+| 1,024 | 0.070ms | 0.158ms | **2.26x** |
+| 2,048 | 0.132ms | 0.508ms | **3.85x** |
+| 4,096 | 0.242ms | 1.78ms | **7.33x** |
+| 8,192 | 0.570ms | 6.65ms | **11.7x** |
+| 16,384 | 2.49ms | 26.0ms | **10.5x** |
+| 32,768 | 8.77ms | 102ms | **11.7x** |
+| 65,536 | 17.0ms | 407ms | **24.0x** |
+| 131,072 | 55.2ms | 1624ms | **29.4x** |
+| 262,144 | 125ms | 6412ms | **51.4x** |
+
+*XL model (32 heads × 128-dim = 4096-dim) OOMs at 512K on 16GB VRAM due to tensor allocation.*
+
+#### Crossover Points (where Cron Root ≥ SDPA)
+
+| Model Size | Heads × Head Dim | Crossover |
+|------------|-------------------|-----------|
+| Small | 8 × 64 | ~2,048 tokens |
+| Medium | 12 × 64 | ~1,024 tokens |
+| Large | 16 × 128 | ~1,024 tokens |
+| XL | 32 × 128 | **~512 tokens** |
+
+Larger models benefit more — SDPA's O(N²) cost grows with H·D, while Cron Root's O(N√N) cost is less sensitive to model width.
 
 ### End-to-End Training Performance (Forward + Backward)
 
@@ -44,23 +108,42 @@ Cron Root Attention achieves **up to 57x forward kernel speedup** over SDPA/Flas
 
 Training crossover is **~2K tokens** (was ~12K before optimization). The backward uses a **single fully-fused kernel** for S ≤ 8K that computes dQ + local dK/dV + strided dK/dV in one launch.
 
-### Inference Benchmarks (no_grad prefill)
+### Cold Start vs Warm Start (Triton JIT Compile Overhead)
 
-| Sequence Length | Cron Root | SDPA (Flash) | Inference Speedup |
-|-----------------|-----------|--------------|-------------------|
-| 512 | 0.031ms | 0.017ms | 0.53x |
-| 1,024 | 0.030ms | 0.031ms | **1.02x** |
-| 2,048 | 0.032ms | 0.109ms | **3.44x** |
-| 4,096 | 0.032ms | 0.295ms | **9.24x** |
-| 8,192 | 0.072ms | 0.966ms | **13.3x** |
-| 16,384 | 0.335ms | 3.32ms | **9.91x** |
-| 32,768 | 1.19ms | 12.8ms | **10.8x** |
-| 65,536 | 2.68ms | 49.7ms | **18.6x** |
-| 131,072 | 7.28ms | 197ms | **27.0x** |
-| 262,144 | 17.0ms | 772ms | **45.3x** |
-| 524,288 | 54.4ms | 3089ms | **56.8x** |
+Cron Root uses Triton JIT-compiled kernels. The **first call** at each unique `(S, √N, D)` combination triggers PTX compilation. Subsequent calls reuse the cached kernel.
 
-> **Note**: The **hybrid mode** (`cron_root_attention_hybrid`) auto-selects SDPA for S < 1536 and Cron Root for S ≥ 1536, guaranteeing **≥1.0x speedup at ALL sequence lengths**. For inference-only workloads, the forward kernel crossover is only ~1K tokens.
+| Sequence Length | Cold Start | Warm (Steady-State) | JIT Overhead |
+|-----------------|------------|---------------------|--------------|
+| 512 | 221ms | 0.040ms | 221ms (one-time) |
+| 1,024 | 1.7ms | 0.042ms | 1.6ms |
+| 4,096 | 1.5ms | 0.061ms | 1.5ms |
+| 16,384 | 11.6ms | 0.339ms | 11.2ms |
+| 65,536 | 3.9ms | 2.35ms | 1.5ms |
+| 131,072 | 7.9ms | 7.33ms | 0.5ms |
+| 524,288 | 52.6ms | 52.1ms | 0.4ms |
+
+*Cold start measured as the first call in a fresh Python process. The ~221ms at S=512 is the one-time Triton PTX compilation + cache write, which is amortized across all subsequent sequence lengths in the same process. New `(SQRT_N, BLOCK_D)` combinations incur smaller recompilations (1–12ms). At long sequences, the kernel compute time dominates and cold ≈ warm.*
+
+### Scaling Analysis (O(N√N) vs O(N²))
+
+When doubling the sequence length, Cron Root time grows by **~2–3.4×** (consistent with O(N√N)), while SDPA grows by **~3.6–4.0×** (consistent with O(N²)).
+
+| Seq Len Doubling | CronRoot Scaling | SDPA Scaling | Theoretical |
+|------------------|-----------------|-------------|-------------|
+| 512 → 1K | 1.05× | 1.54× | √2 ≈ 1.41 vs 4× |
+| 1K → 2K | 1.15× | 3.05× | (launch overhead floor) |
+| 4K → 8K | 1.68× | 3.18× | Approaching √2·2 ≈ 2.83 |
+| 16K → 32K | 3.44× | 3.93× | Compute-dominated |
+| 64K → 128K | 3.12× | 3.96× | SDPA → perfect 4× |
+| 256K → 512K | 3.02× | 3.99× | CronRoot ≈ 3×, SDPA ≈ 4× |
+
+*At short sequences (< 4K), both kernels are in the launch-overhead floor where absolute times are sub-0.1ms. True algorithmic scaling appears above 8K tokens.*
+
+### Dual-GPU Consistency
+
+Benchmarks run independently on two RTX 5070 Ti GPUs show **< 3% variance** between cards, confirming symmetric memory bandwidth and compute parity.
+
+> **Note**: The **hybrid mode** (`cron_root_attention_hybrid`) auto-selects SDPA for S < 1536 and Cron Root for S ≥ 1536, guaranteeing **≥1.0x speedup at ALL sequence lengths**. For inference-only workloads, the forward kernel crossover varies by model size (see crossover table above).
 
 ## 📦 Installation
 

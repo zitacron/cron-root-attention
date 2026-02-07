@@ -25,11 +25,13 @@ Supported GPUs:
 - NVIDIA B100/B200/GB200 (Blackwell datacenter)
 - Auto-detection via torch.cuda.get_device_properties()
 
-Performance (RTX 5070 Ti, FP16):
-- S=16K:  28.2x forward speedup, 2.49x training speedup
-- S=64K:  66.1x forward speedup, 5.05x training speedup
-- S=128K: 97.6x forward speedup, 7.16x training speedup
-- S=512K: 202x forward speedup
+Performance (RTX 5070 Ti, FP16, verified warm-start benchmarks):
+- Forward pass speedup vs SDPA (multiple model sizes):
+  Small (H=8, D=64):    S=4K: 4.8x, S=64K: 20.6x, S=512K: 58.4x
+  Large (H=16, D=128):  S=4K: 6.9x, S=64K: 24.2x, S=512K: 67.8x
+  XL (H=32, D=128):     S=4K: 7.3x, S=64K: 24.0x, S=256K: 51.4x
+- Crossover: ~2K (small), ~1K (large), ~512 (XL)
+- Cold start: ~221ms first call (Triton JIT), <2ms thereafter
 
 (c) 2026 Zitacron. All rights reserved.
 Licensed under Apache 2.0 - See LICENSE file for details.

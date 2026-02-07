@@ -3,8 +3,8 @@ Cron Root Attention - Sub-quadratic Attention for Long-Context Transformers
 ============================================================================
 
 A high-performance Triton implementation of √N sparse attention achieving
-O(N√N) complexity instead of O(N²), enabling up to 57x kernel speedups at
-long sequence lengths.
+O(N√N) complexity instead of O(N²), enabling up to 68x forward kernel speedups
+at long sequence lengths (higher for larger models).
 
 (c) 2026 Zitacron. All rights reserved.
 Licensed under Apache 2.0 - See LICENSE file for details.
@@ -24,22 +24,38 @@ Supported GPUs:
     - Auto-detection of SM count for optimal grid sizing
 
 Key Results (RTX 5070 Ti, FP16, PyTorch 2.9.1 + CUDA 12.8):
-    Forward pass (kernel only):
-        S=1024:   1.02x speedup vs SDPA/Flash  (crossover ~1K)
-        S=2048:   3.44x speedup
-        S=4096:   9.24x speedup
-        S=8192:   13.3x speedup
-        S=16384:  9.91x speedup
-        S=65536:  18.6x speedup
-        S=131072: 27.0x speedup
-        S=262144: 45.3x speedup  
-        S=524288: 56.8x speedup
-    
+    Forward pass — Small model (H=8, D=64):
+        S=512:    0.59x vs SDPA  (crossover ~2K)
+        S=2048:   2.31x speedup
+        S=4096:   4.76x speedup
+        S=8192:   8.96x speedup
+        S=65536:  20.6x speedup
+        S=262144: 44.1x speedup
+        S=524288: 58.4x speedup
+
+    Forward pass — Large model (H=16, D=128):
+        S=512:    0.84x vs SDPA  (crossover ~1K)
+        S=1024:   1.92x speedup
+        S=4096:   6.87x speedup
+        S=8192:   11.4x speedup
+        S=65536:  24.2x speedup
+        S=262144: 52.3x speedup
+        S=524288: 67.8x speedup
+
+    Forward pass — XL model (H=32, D=128):
+        S=512:    1.17x speedup  (crossover ~512!)
+        S=4096:   7.33x speedup
+        S=131072: 29.4x speedup
+        S=262144: 51.4x speedup
+
     Training (fwd+bwd):
         S=4096:  1.45x, S=8192: 1.73x, S=131K: 3.76x
         Crossover ~2K (fully-fused single-kernel backward for S≤8K)
-    
+
     Hybrid mode: ≥1.0x at ALL lengths (auto SDPA below 1536)
+
+    Cold start: ~221ms first-ever call (Triton JIT compile, one-time).
+    Subsequent new seq_lens: 1-12ms. Warm calls: sub-ms at S≤8K.
 
 Usage:
     from cron_root_attention import cron_root_attention, CronRootAttention
