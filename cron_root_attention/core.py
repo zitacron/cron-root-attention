@@ -1978,6 +1978,12 @@ class CronRootAttentionV14Function(torch.autograd.Function):
         return dq, dk, dv, None
 
 
+# Tell torch.compile (Dynamo) to graph-break at the CronRoot boundary.
+# The Triton kernels inside are already JIT-compiled GPU code — Inductor
+# cannot improve them.  This lets the REST of the model (MLPs, norms,
+# projections, gating) be compiled and fused by Inductor while CronRoot
+# executes in eager mode with its own optimized Triton kernels.
+@torch.compiler.disable
 def cron_root_attention_v14(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                        use_persistent: bool = False) -> torch.Tensor:
     """
