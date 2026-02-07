@@ -156,7 +156,7 @@ This image shows that our N√N complexity IS working as intended, making it sca
 
 <img width="1647" height="1374" alt="image" src="https://github.com/user-attachments/assets/fbf5b8cf-7355-4c01-a74b-3da6fb13e878" />
 
-So desipite the speedup at longer sequences, there is still a slight overhead for calculating the √ of the sequence. This essentially means we are trading compute for memory, yet compute is so low the net gain is positive.
+So desipite the speedup at longer sequences, there is still a slight overhead for calculating the √ of the sequence and python overhead. This essentially means we are trading compute for memory, yet compute is so low the net gain is positive.
 
 "What is the point of dealing with smaller sequence lengths if AI's need **bigger** context lengths?"
 
