@@ -1,4 +1,4 @@
-# Cron Root Attention™
+# Cron Root Attention
 
 **Sub-quadratic O(N√N) attention with 2-hop relay for long-context transformers**
 
@@ -343,11 +343,8 @@ NOTICE - See [NOTICE](NOTICE) for further details.
 - Built on [Triton](https://github.com/openai/triton) by OpenAI
 - Optimized for NVIDIA Blackwell architecture (GB203) (more to come!)
 
-**Zitacron** - Building the future of efficient AI
-
 ---
 
-© 2026 Zitacron. "Zitacron" and "Cron Root Attention" are trademarks of the Zitacron Project. 
-Optimized for NVIDIA Blackwell Architecture.
+© 2026 Zitacron.
 
 
