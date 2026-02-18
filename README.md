@@ -1,4 +1,4 @@
-# Cron Root Attention™
+# Cron Root Attention
 
 **Sub-quadratic O(N√N) attention with 2-hop relay for long-context transformers**
 
@@ -243,7 +243,7 @@ So desipite the speedup at longer sequences, there is still a slight overhead fo
 
 "What is the point of dealing with smaller sequence lengths if AI's need **bigger** context lengths?"
 
-There are use cases for **Encoders** will often have a hard limit of 512 tokens for an input. These include BERT (search engine) RoBERTa (high accuracy text classification) and more. So despite the insane 56.8x speedup cron root attention provides, it is still limited by kernal launch overhead and its own mathematical complexity. 
+There are use cases for **Encoders** will often have a hard limit of 512 tokens for an input. These include BERT (search engine) RoBERTa (high accuracy text classification) and more. So despite the 56.8x speedup CRA (cron root attention) provides, it is still limited by kernal launch overhead and its own mathematical complexity. 
 
 This also affects training speedup a lot more than it does just inferencing with LLMs. As you could see from the table above the crossover efficiency point is 4096, which may be fine for datacenters and other entities where they can afford the memory to scale to that context, but for training SLMs and other BERT related encoders, this isn't all that useful unless you scale up.
 
@@ -343,11 +343,8 @@ NOTICE - See [NOTICE](NOTICE) for further details.
 - Built on [Triton](https://github.com/openai/triton) by OpenAI
 - Optimized for NVIDIA Blackwell architecture (GB203) (more to come!)
 
-**Zitacron** - Building the future of efficient AI
-
 ---
 
-© 2026 Zitacron. "Zitacron" and "Cron Root Attention" are trademarks of the Zitacron Project. 
-Optimized for NVIDIA Blackwell Architecture.
+© 2026 Zitacron.
 
 
