@@ -106,10 +106,15 @@ class CronRootAttention(nn.Module):
         k = k.view(B, S, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, S, self.n_kv_heads, self.head_dim).transpose(1, 2)
         
-        # Expand KV for GQA if needed
+        # Expand KV for GQA if needed.
+        # expand() + reshape avoids the intermediate copy that repeat_interleave
+        # uses for its output buffer; reshape materialises the contiguous tensor
+        # required by the Triton kernels in a single allocation instead of two.
         if self.kv_groups > 1:
-            k = k.repeat_interleave(self.kv_groups, dim=1)
-            v = v.repeat_interleave(self.kv_groups, dim=1)
+            k = k.unsqueeze(2).expand(B, self.n_kv_heads, self.kv_groups, S, self.head_dim) \
+                 .reshape(B, self.n_heads, S, self.head_dim)
+            v = v.unsqueeze(2).expand(B, self.n_kv_heads, self.kv_groups, S, self.head_dim) \
+                 .reshape(B, self.n_heads, S, self.head_dim)
         
         # Apply √N attention
         out = cron_root_attention_v14(q, k, v)  # (B, H, S, D_h)
