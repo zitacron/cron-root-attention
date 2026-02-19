@@ -10,7 +10,7 @@
 
 Cron Root Attention achieves **up to 68x forward kernel speedup** over SDPA/FlashAttention-2 at long sequence lengths by reducing attention complexity from O(N²) to O(N√N), with **100% token coverage** through a 3-phase relay mechanism. Forward crossover varies by model size — as few as **512 tokens** for larger heads. The **hybrid mode** auto-selects SDPA below crossover for zero-regression deployment.
 
-All benchmarks below were measured on **RTX 5070 Ti** (Blackwell GB203, 70 SMs), PyTorch 2.9.1, CUDA 12.8, FP16. Timing uses CUDA events with verified warmup (adaptive 20–50 warmup iterations + stability check with CV < 5% before measurement, trimmed mean of 10–100 measured repeats).
+All benchmarks below were measured on **RTX 5070 Ti** (Blackwell GB203, 70 SMs), PyTorch 2.9.1, CUDA 12.8, FP16, all in python. Timing uses CUDA events with verified warmup (adaptive 20–50 warmup iterations + stability check with CV < 5% before measurement, trimmed mean of 10–100 measured repeats).
 
 ### Forward Pass — Multiple Model Configurations
 
