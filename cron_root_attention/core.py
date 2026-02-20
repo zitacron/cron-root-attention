@@ -201,23 +201,19 @@ def _cron_root_attn_fwd_v14_persistent(
     """
     Persistent kernel: Each of the NUM_SMS blocks runs a while loop,
     pulling tiles from a global work queue until all work is done.
-    
+
     Tile layout: total tiles = B * H * ceil(S / BLOCK_M)
     Each tile processes BLOCK_M consecutive queries.
     """
     pid = tl.program_id(0)
-    
+
     # Number of query tiles per (batch, head)
     tiles_per_bh = (S + BLOCK_M - 1) // BLOCK_M
-    
-    # Persistent loop: keep grabbing work until done
-    while True:
-        # Atomically grab the next tile
-        tile_idx = tl.atomic_add(WorkCounter, 1)
-        
-        if tile_idx >= TOTAL_TILES:
-            return
-        
+
+    # Work-stealing loop: grab first tile before entering the while condition.
+    # Triton does not allow `return` inside while/for — use while-cond pattern.
+    tile_idx = tl.atomic_add(WorkCounter, 1)
+    while tile_idx < TOTAL_TILES:
         # Decode tile_idx -> (b, h, tile_m)
         bh_idx = tile_idx // tiles_per_bh
         tile_m = tile_idx % tiles_per_bh
@@ -373,6 +369,9 @@ def _cron_root_attn_fwd_v14_persistent(
         l_ptr = L + b * stride_lb + h * stride_lh
         lse = m_i + tl.log(tl.maximum(l_i, 1e-6))
         tl.store(l_ptr + m_offsets * stride_lm, lse, mask=m_mask)
+
+        # Grab next tile for the while-cond loop
+        tile_idx = tl.atomic_add(WorkCounter, 1)
 
 
 # =============================================================================
@@ -1804,11 +1803,32 @@ class CronRootAttentionV14Function(torch.autograd.Function):
         # Allocate outputs
         o = torch.empty_like(q)
         L = torch.empty(B, H, S, dtype=torch.float32, device=q.device)
-        
-        # Standard tiled kernel path
+
         num_tiles = (S + BLOCK_M - 1) // BLOCK_M
-        
-        _cron_root_attn_fwd_v14_tiled[(B, H, num_tiles)](
+
+        if use_persistent and skip_relay:
+            # Persistent work-stealing kernel: exactly NUM_SMS blocks with internal
+            # work queue. Optimal for S <= auto_persistent_threshold (default 4096).
+            # Relay skipped: for S <= RELAY_THRESHOLD the strided path covers global
+            # context with no extra overhead.
+            total_tiles = B * H * num_tiles
+            work_ctr = torch.zeros(1, dtype=torch.int32, device=q.device)
+            _cron_root_attn_fwd_v14_persistent[(_get_num_sms(),)](
+                q, k, v, o, L,
+                work_ctr,
+                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+                k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+                v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+                o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+                L.stride(0), L.stride(1), L.stride(2),
+                B=B, H=H, S=S, D=D,
+                SQRT_N=SQRT_N, TOTAL_TILES=total_tiles,
+                BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
+                BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
+            )
+        else:
+            # Standard tiled kernel path (fixed grid; supports relay for S > 8192)
+            _cron_root_attn_fwd_v14_tiled[(B, H, num_tiles)](
                 q, k, v, o, L,
                 relay_k, relay_v,
                 q.stride(0), q.stride(1), q.stride(2), q.stride(3),
