@@ -1764,10 +1764,15 @@ class CronRootAttentionV14Function(torch.autograd.Function):
         B, H, S, D = q.shape
         SQRT_N = int(math.ceil(math.sqrt(S)))
         
-        # Block sizes tuned for RTX 5070 Ti (101KB shared memory limit)
-        BLOCK_M = 32  # Queries per tile
+        # Block sizes for RTX consumer GPUs (SRAM limit ~101376 B).
+        # The fully-fused backward kernel was measured to require 131072 B
+        # (Required: 131072, Hardware limit: 101376) with BLOCK_M=32, BLOCK_D=128.
+        # Footprint scales linearly with BLOCK_M, so halving to BLOCK_M=16
+        # drops requirement to ~65536 B which fits comfortably.
+        # BLOCK_D=64 (e.g. TRM heads) has 2× headroom, so BLOCK_M=32 is safe there.
         BLOCK_D = triton.next_power_of_2(D)
-        BLOCK_LOCAL = 32
+        BLOCK_M = 16 if BLOCK_D >= 128 else 32   # Queries per tile
+        BLOCK_LOCAL = BLOCK_M                     # Local window tile matches query tile
         BLOCK_STRIDE = 16
         BLOCK_RELAY = 16  # Relay blocks per iteration
         
