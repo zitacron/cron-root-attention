@@ -2038,11 +2038,14 @@ class CronRootAttentionV14(nn.Module):
     - Same 2√N complexity and 2-hop reachability as V13
     """
     
-    def __init__(self, use_persistent: bool = False, auto_persistent_threshold: int = 4096):
+    def __init__(self, use_persistent: bool = False, auto_persistent_threshold: int = 0):
         """
         Args:
             use_persistent: Force persistent kernel usage
-            auto_persistent_threshold: Auto-enable persistent for S <= this value
+            auto_persistent_threshold: Auto-enable persistent for S <= this value.
+                Benchmarks (D=128, BLOCK_M=16): persistent is 2-2.5x SLOWER than
+                tiled at all S due to tl.atomic_add overhead dominating compute.
+                Set to 0 (disabled by default) until tile compute intensity is high.
         """
         super().__init__()
         self.use_persistent = use_persistent
