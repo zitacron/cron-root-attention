@@ -23,13 +23,14 @@ Chunk loop (chunk_size=256 optimal on 64 MB L3):
   BF16 scores_23 at T=8192 is 48 MB → fits entirely in 64 MB L3.
 
 Benchmarks (Ryzen 9 7900X, B=1, H=16, d=128, chunk=256):
-  dtype  │  T=4096       │  T=8192          │  T=16384
-  ───────┼───────────────┼──────────────────┼──────────────────
-  FP32   │  1.19× eager  │  1.77× eager     │  3.32× eager
-  FP32   │  1.69× compile│  2.62× compile   │  4.17× compile
-  BF16   │  —            │  3.22× eager     │  4.80× eager
-  BF16   │  —            │  5.20× compile   │  7.81× compile
+  dtype   T=4096          T=8192          T=16384
+  FP32    1.29× eager     1.75× eager     3.64× eager
+  FP32    1.63× compile   2.48× compile   4.13× compile
+  BF16    2.19× eager     3.53× eager     5.16× eager
+  BF16    4.78× compile   6.65× compile   7.80× compile
 
+BF16 key insight: scores_23 at BF16/T=8192 = 48 MB → fits 64 MB L3.
+BF16 at T=4096 also benefits hugely: 4.78×, likely due to L3-resident tensors.
 Theoretical speedup = √T/3: T=8192→30×, T=16384→43×.
 Remaining gap: Phase-1 loop has ~T/256 small BLAS dispatches; a C extension
 with fused CBLAS calls would eliminate per-iteration Python overhead.
