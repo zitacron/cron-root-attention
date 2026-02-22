@@ -396,6 +396,7 @@ def _cron_root_attn_fwd_v14_tiled(
     BLOCK_LOCAL: tl.constexpr,
     BLOCK_STRIDE: tl.constexpr,
     BLOCK_RELAY: tl.constexpr,
+    KV_GROUPS: tl.constexpr,  # K/V heads per Q head (1 = MHA, >1 = GQA)
 ):
     """
     Non-persistent tiled kernel: One thread block per (B, H, tile_m).
@@ -450,7 +451,7 @@ def _cron_root_attn_fwd_v14_tiled(
         n_valid = (n_offsets >= 0) & (n_offsets <= global_window_end) & (n_offsets < S)
         
         # Load K: [BLOCK_LOCAL, D]
-        k_ptr = K + b * stride_kb + h * stride_kh
+        k_ptr = K + b * stride_kb + (h // KV_GROUPS) * stride_kh
         k = tl.load(
             k_ptr + n_offsets[:, None] * stride_kn + d_idx[None, :] * stride_kd,
             mask=n_valid[:, None] & (d_idx[None, :] < D),
@@ -489,7 +490,7 @@ def _cron_root_attn_fwd_v14_tiled(
         acc = acc * alpha[:, None]
         
         # Load V: [BLOCK_LOCAL, D]
-        v_ptr = V + b * stride_vb + h * stride_vh
+        v_ptr = V + b * stride_vb + (h // KV_GROUPS) * stride_vh
         v = tl.load(
             v_ptr + n_offsets[:, None] * stride_vn + d_idx[None, :] * stride_vd,
             mask=n_valid[:, None] & (d_idx[None, :] < D),
@@ -517,7 +518,7 @@ def _cron_root_attn_fwd_v14_tiled(
         n_valid = (stride_indices < max_num_strided) & (n_offsets < S)
         
         # Load K: [BLOCK_STRIDE, D]
-        k_ptr = K + b * stride_kb + h * stride_kh
+        k_ptr = K + b * stride_kb + (h // KV_GROUPS) * stride_kh
         k = tl.load(
             k_ptr + n_offsets[:, None] * stride_kn + d_idx[None, :] * stride_kd,
             mask=n_valid[:, None] & (d_idx[None, :] < D),
@@ -548,7 +549,7 @@ def _cron_root_attn_fwd_v14_tiled(
         acc = acc * alpha[:, None]
         
         # Load V: [BLOCK_STRIDE, D]
-        v_ptr = V + b * stride_vb + h * stride_vh
+        v_ptr = V + b * stride_vb + (h // KV_GROUPS) * stride_vh
         v = tl.load(
             v_ptr + n_offsets[:, None] * stride_vn + d_idx[None, :] * stride_vd,
             mask=n_valid[:, None] & (d_idx[None, :] < D),
@@ -571,7 +572,7 @@ def _cron_root_attn_fwd_v14_tiled(
         r_valid = r_indices < NUM_RELAY
         
         # Load relay K: [BLOCK_RELAY, D]
-        rk_ptr = RK + b * stride_rkb + h * stride_rkh
+        rk_ptr = RK + b * stride_rkb + (h // KV_GROUPS) * stride_rkh
         rk = tl.load(
             rk_ptr + r_indices[:, None] * stride_rkn + d_idx[None, :] * stride_rkd,
             mask=r_valid[:, None] & (d_idx[None, :] < D),
@@ -602,7 +603,7 @@ def _cron_root_attn_fwd_v14_tiled(
         acc = acc * alpha[:, None]
         
         # Load relay V: [BLOCK_RELAY, D]
-        rv_ptr = RV + b * stride_rvb + h * stride_rvh
+        rv_ptr = RV + b * stride_rvb + (h // KV_GROUPS) * stride_rvh
         rv = tl.load(
             rv_ptr + r_indices[:, None] * stride_rvn + d_idx[None, :] * stride_rvd,
             mask=r_valid[:, None] & (d_idx[None, :] < D),
@@ -957,6 +958,7 @@ def _cron_root_attn_bwd_fully_fused(
     S: tl.constexpr, D: tl.constexpr, SQRT_N: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
     BLOCK_LOCAL: tl.constexpr, BLOCK_STRIDE: tl.constexpr,
+    KV_GROUPS: tl.constexpr,  # K/V heads per Q head (1 = MHA, >1 = GQA)
 ):
     """
     FULLY FUSED Backward: dQ + local dK/dV + strided dK/dV in ONE kernel.
@@ -1047,8 +1049,8 @@ def _cron_root_attn_bwd_fully_fused(
         dv_contrib = tl.dot(tl.trans(p.to(do.dtype)), do)
         
         # Atomic add to dK/dV — low contention: each key touched by ≤2 query tiles
-        dk_base = dK + b * stride_dkb + h * stride_dkh
-        dv_base = dV + b * stride_dvb + h * stride_dvh
+        dk_base = dK + b * stride_dkb + (h // KV_GROUPS) * stride_dkh
+        dv_base = dV + b * stride_dvb + (h // KV_GROUPS) * stride_dvh
         tl.atomic_add(
             dk_base + n_offsets[:, None] * stride_dkn + d_idx[None, :] * stride_dkd,
             dk_contrib.to(dK.dtype.element_ty),
@@ -1094,8 +1096,8 @@ def _cron_root_attn_bwd_fully_fused(
             dk_contrib = tl.sum(dp[:, None] * q, axis=0) * scale
             dv_contrib = tl.sum(p[:, None] * do, axis=0)
             
-            dk_ptr = dK + b * stride_dkb + h * stride_dkh + k_pos * stride_dkn
-            dv_ptr = dV + b * stride_dvb + h * stride_dvh + k_pos * stride_dvn
+            dk_ptr = dK + b * stride_dkb + (h // KV_GROUPS) * stride_dkh + k_pos * stride_dkn
+            dv_ptr = dV + b * stride_dvb + (h // KV_GROUPS) * stride_dvh + k_pos * stride_dvn
             tl.atomic_add(dk_ptr + d_idx * stride_dkd, dk_contrib.to(dK.dtype.element_ty), mask=d_idx < D)
             tl.atomic_add(dv_ptr + d_idx * stride_dvd, dv_contrib.to(dV.dtype.element_ty), mask=d_idx < D)
     
@@ -1759,8 +1761,9 @@ class CronRootAttentionV14Function(torch.autograd.Function):
     
     @staticmethod
     def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                use_persistent: bool = False) -> torch.Tensor:
-        B, H, S, D = q.shape
+                use_persistent: bool = False, kv_groups: int = 1) -> torch.Tensor:
+        B, H_q, S, D = q.shape
+        H_kv = k.shape[1]  # H_q // kv_groups (or H_q when kv_groups==1)
         SQRT_N = int(math.ceil(math.sqrt(S)))
         
         # Block sizes for RTX consumer GPUs (SRAM limit ~101376 B).
@@ -1785,8 +1788,8 @@ class CronRootAttentionV14Function(torch.autograd.Function):
         if skip_relay:
             NUM_RELAY = 0
             # Dummy relay buffers (never accessed since NUM_RELAY=0)
-            relay_k = torch.empty(B, H, 1, D, device=q.device, dtype=q.dtype)
-            relay_v = torch.empty(B, H, 1, D, device=q.device, dtype=q.dtype)
+            relay_k = torch.empty(B, H_kv, 1, D, device=q.device, dtype=q.dtype)
+            relay_v = torch.empty(B, H_kv, 1, D, device=q.device, dtype=q.dtype)
         else:
             # Full relay pre-computation
             NUM_RELAY = (S + SQRT_N - 1) // SQRT_N
@@ -1797,12 +1800,12 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             else:
                 k_padded = k
                 v_padded = v
-            relay_k = k_padded.reshape(B, H, NUM_RELAY, SQRT_N, D).mean(dim=3).contiguous()
-            relay_v = v_padded.reshape(B, H, NUM_RELAY, SQRT_N, D).mean(dim=3).contiguous()
+            relay_k = k_padded.reshape(B, H_kv, NUM_RELAY, SQRT_N, D).mean(dim=3).contiguous()
+            relay_v = v_padded.reshape(B, H_kv, NUM_RELAY, SQRT_N, D).mean(dim=3).contiguous()
         
         # Allocate outputs
         o = torch.empty_like(q)
-        L = torch.empty(B, H, S, dtype=torch.float32, device=q.device)
+        L = torch.empty(B, H_q, S, dtype=torch.float32, device=q.device)
 
         num_tiles = (S + BLOCK_M - 1) // BLOCK_M
 
@@ -1811,7 +1814,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             # work queue. Optimal for S <= auto_persistent_threshold (default 4096).
             # Relay skipped: for S <= RELAY_THRESHOLD the strided path covers global
             # context with no extra overhead.
-            total_tiles = B * H * num_tiles
+            total_tiles = B * H_q * num_tiles
             work_ctr = torch.zeros(1, dtype=torch.int32, device=q.device)
             _cron_root_attn_fwd_v14_persistent[(_get_num_sms(),)](
                 q, k, v, o, L,
@@ -1821,14 +1824,14 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                 v.stride(0), v.stride(1), v.stride(2), v.stride(3),
                 o.stride(0), o.stride(1), o.stride(2), o.stride(3),
                 L.stride(0), L.stride(1), L.stride(2),
-                B=B, H=H, S=S, D=D,
+                B=B, H=H_q, S=S, D=D,
                 SQRT_N=SQRT_N, TOTAL_TILES=total_tiles,
                 BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
                 BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
             )
         else:
             # Standard tiled kernel path (fixed grid; supports relay for S > 8192)
-            _cron_root_attn_fwd_v14_tiled[(B, H, num_tiles)](
+            _cron_root_attn_fwd_v14_tiled[(B, H_q, num_tiles)](
                 q, k, v, o, L,
                 relay_k, relay_v,
                 q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -1842,6 +1845,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                 NUM_RELAY=NUM_RELAY, BLOCK_RELAY=BLOCK_RELAY,
                 BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
                 BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
+                KV_GROUPS=kv_groups,
             )
         
         ctx.save_for_backward(q, k, v, o, L, relay_k, relay_v)
@@ -1853,13 +1857,15 @@ class CronRootAttentionV14Function(torch.autograd.Function):
         ctx.BLOCK_LOCAL = BLOCK_LOCAL
         ctx.BLOCK_STRIDE = BLOCK_STRIDE
         ctx.BLOCK_RELAY = BLOCK_RELAY
+        ctx.kv_groups = kv_groups
         
         return o
     
     @staticmethod
     def backward(ctx, do: torch.Tensor):
         q, k, v, o, L, relay_k, relay_v = ctx.saved_tensors
-        B, H, S, D = q.shape
+        B, H_q, S, D = q.shape
+        H_kv = k.shape[1]  # H_q // kv_groups
         SQRT_N = ctx.SQRT_N
         NUM_RELAY = ctx.NUM_RELAY
         skip_relay = ctx.skip_relay
@@ -1870,6 +1876,13 @@ class CronRootAttentionV14Function(torch.autograd.Function):
         BLOCK_RELAY = ctx.BLOCK_RELAY
         
         use_fused_bwd = (S <= CronRootAttentionV14Function.FUSED_BWD_THRESHOLD)
+        
+        if not use_fused_bwd and ctx.kv_groups != 1:
+            raise NotImplementedError(
+                f"GQA (kv_groups={ctx.kv_groups}) is only supported for S <= "
+                f"{CronRootAttentionV14Function.FUSED_BWD_THRESHOLD}. "
+                f"Got S={S}. The long-seq backward kernels do not yet support GQA."
+            )
         
         if use_fused_bwd and skip_relay:
             # =============================================================
@@ -1887,7 +1900,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             
             num_tiles_m = (S + BLOCK_M - 1) // BLOCK_M
             
-            _cron_root_attn_bwd_fully_fused[(B, H, num_tiles_m)](
+            _cron_root_attn_bwd_fully_fused[(B, H_q, num_tiles_m)](
                 q, k, v, o, do, dq, dk, dv, L,
                 q.stride(0), q.stride(1), q.stride(2), q.stride(3),
                 k.stride(0), k.stride(1), k.stride(2), k.stride(3),
@@ -1901,6 +1914,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                 S=S, D=D, SQRT_N=SQRT_N,
                 BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
                 BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
+                KV_GROUPS=ctx.kv_groups,
             )
             
             # No relay scatter needed — skip_relay=True
@@ -1914,7 +1928,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             
             # dQ-ONLY KERNEL (includes relay Phase 3 contribution to dQ)
             num_tiles_m = (S + BLOCK_M - 1) // BLOCK_M
-            _cron_root_attn_bwd_dq_only_v14[(B, H, num_tiles_m)](
+            _cron_root_attn_bwd_dq_only_v14[(B, H_q, num_tiles_m)](
                 q, k, v, o, do, dq, L,
                 relay_k, relay_v,
                 q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -1937,7 +1951,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             BLOCK_Q = 32
             num_tiles_n = (S + BLOCK_N - 1) // BLOCK_N
             
-            _dkdv_local_phase[(B, H, num_tiles_n)](
+            _dkdv_local_phase[(B, H_q, num_tiles_n)](
                 q, k, v, o, do, dk, dv, L,
                 q.stride(0), q.stride(1), q.stride(2), q.stride(3),
                 k.stride(0), k.stride(1), k.stride(2), k.stride(3),
@@ -1956,7 +1970,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             BLOCK_Q_STRIDED = 64
             
             if num_strided_keys > 0:
-                _dkdv_strided_key_centric[(num_strided_keys, B, H)](
+                _dkdv_strided_key_centric[(num_strided_keys, B, H_q)](
                     q, k, v, o, do, dk, dv, L,
                     q.stride(0), q.stride(1), q.stride(2), q.stride(3),
                     k.stride(0), k.stride(1), k.stride(2), k.stride(3),
@@ -1976,7 +1990,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                 d_relay_v = torch.zeros_like(relay_v)
                 BLOCK_Q_RELAY = 64
                 
-                _dkdv_relay_v14[(NUM_RELAY, B, H)](
+                _dkdv_relay_v14[(NUM_RELAY, B, H_q)](
                     q, relay_k, relay_v, o, do, d_relay_k, d_relay_v, L,
                     q.stride(0), q.stride(1), q.stride(2), q.stride(3),
                     relay_k.stride(0), relay_k.stride(1), relay_k.stride(2), relay_k.stride(3),
@@ -1992,15 +2006,15 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                 )
                 
                 # SCATTER RELAY GRADIENTS BACK TO dK, dV
-                d_relay_k_expanded = (d_relay_k / SQRT_N).unsqueeze(3).expand(B, H, NUM_RELAY, SQRT_N, D)
-                d_relay_k_expanded = d_relay_k_expanded.reshape(B, H, NUM_RELAY * SQRT_N, D)
+                d_relay_k_expanded = (d_relay_k / SQRT_N).unsqueeze(3).expand(B, H_kv, NUM_RELAY, SQRT_N, D)
+                d_relay_k_expanded = d_relay_k_expanded.reshape(B, H_kv, NUM_RELAY * SQRT_N, D)
                 dk[:, :, :S, :] += d_relay_k_expanded[:, :, :S, :]
                 
-                d_relay_v_expanded = (d_relay_v / SQRT_N).unsqueeze(3).expand(B, H, NUM_RELAY, SQRT_N, D)
-                d_relay_v_expanded = d_relay_v_expanded.reshape(B, H, NUM_RELAY * SQRT_N, D)
+                d_relay_v_expanded = (d_relay_v / SQRT_N).unsqueeze(3).expand(B, H_kv, NUM_RELAY, SQRT_N, D)
+                d_relay_v_expanded = d_relay_v_expanded.reshape(B, H_kv, NUM_RELAY * SQRT_N, D)
                 dv[:, :, :S, :] += d_relay_v_expanded[:, :, :S, :]
         
-        return dq, dk, dv, None
+        return dq, dk, dv, None, None  # extra None for kv_groups arg
 
 
 # Tell torch.compile (Dynamo) to graph-break at the CronRoot boundary.
@@ -2010,22 +2024,26 @@ class CronRootAttentionV14Function(torch.autograd.Function):
 # executes in eager mode with its own optimized Triton kernels.
 @torch.compiler.disable
 def cron_root_attention_v14(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                       use_persistent: bool = False) -> torch.Tensor:
+                       use_persistent: bool = False, kv_groups: int = 1) -> torch.Tensor:
     """
-    V14 Tiled Cron Root Attention.
+    V14 Tiled Cron Root Attention with optional GQA support.
     
     Optimized for small-to-medium sequence lengths (S < 16K) with:
     - Fused block-query processing (64 queries per block)
     - Optional persistent kernel for minimal launch overhead
+    - Native GQA: pass kv_groups>1 and k/v with shape (B, H//kv_groups, S, D)
     
     Args:
-        q, k, v: Query, Key, Value tensors of shape (B, H, S, D)
+        q: Query tensor of shape (B, H_q, S, D)
+        k: Key tensor of shape   (B, H_kv, S, D)  where H_kv = H_q // kv_groups
+        v: Value tensor of shape (B, H_kv, S, D)
         use_persistent: If True, use persistent kernel (best for S < 4K)
+        kv_groups: Number of query heads per KV head (1 = MHA, 4 = GQA-4)
     
     Returns:
-        Output tensor of shape (B, H, S, D)
+        Output tensor of shape (B, H_q, S, D)
     """
-    return CronRootAttentionV14Function.apply(q, k, v, use_persistent)
+    return CronRootAttentionV14Function.apply(q, k, v, use_persistent, kv_groups)
 
 
 class CronRootAttentionV14(nn.Module):
