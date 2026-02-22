@@ -2045,8 +2045,8 @@ def cron_root_attention_v14(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         Output tensor of shape (B, H_q, S, D)
     """
     if q.device.type == 'cpu':
-        from .cpu_reference import cra_cpu
-        return cra_cpu(q, k, v)
+        from .cpu_reference import cra_cpu_compiled
+        return cra_cpu_compiled(q, k, v)
     return CronRootAttentionV14Function.apply(q, k, v, use_persistent, kv_groups)
 
 
