@@ -2032,6 +2032,7 @@ def cron_root_attention_v14(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     - Fused block-query processing (64 queries per block)
     - Optional persistent kernel for minimal launch overhead
     - Native GQA: pass kv_groups>1 and k/v with shape (B, H//kv_groups, S, D)
+    - Automatic CPU fallback via vectorized BLAS-based cpu_reference.cra_cpu
     
     Args:
         q: Query tensor of shape (B, H_q, S, D)
@@ -2043,6 +2044,9 @@ def cron_root_attention_v14(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     Returns:
         Output tensor of shape (B, H_q, S, D)
     """
+    if q.device.type == 'cpu':
+        from .cpu_reference import cra_cpu
+        return cra_cpu(q, k, v)
     return CronRootAttentionV14Function.apply(q, k, v, use_persistent, kv_groups)
 
 
