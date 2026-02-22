@@ -1018,11 +1018,11 @@ def _cron_root_attn_bwd_fully_fused(
         n_offsets = window_start + n + tl.arange(0, BLOCK_LOCAL)
         n_mask = (n_offsets >= 0) & (n_offsets <= window_end) & (n_offsets < S)
         
-        k_ptr = K + b * stride_kb + h * stride_kh
+        k_ptr = K + b * stride_kb + (h // KV_GROUPS) * stride_kh
         k = tl.load(k_ptr + n_offsets[:, None] * stride_kn + d_idx[None, :] * stride_kd,
                     mask=n_mask[:, None] & (d_idx[None, :] < D), other=0.0)
         
-        v_ptr = V + b * stride_vb + h * stride_vh
+        v_ptr = V + b * stride_vb + (h // KV_GROUPS) * stride_vh
         v = tl.load(v_ptr + n_offsets[:, None] * stride_vn + d_idx[None, :] * stride_vd,
                     mask=n_mask[:, None] & (d_idx[None, :] < D), other=0.0)
         
@@ -1074,11 +1074,11 @@ def _cron_root_attn_bwd_fully_fused(
         k_pos = s_idx * SQRT_N
         
         if k_pos < S:
-            k_ptr = K + b * stride_kb + h * stride_kh
+            k_ptr = K + b * stride_kb + (h // KV_GROUPS) * stride_kh
             key = tl.load(k_ptr + k_pos * stride_kn + d_idx * stride_kd,
                           mask=d_idx < D, other=0.0)
             
-            v_ptr = V + b * stride_vb + h * stride_vh
+            v_ptr = V + b * stride_vb + (h // KV_GROUPS) * stride_vh
             val = tl.load(v_ptr + k_pos * stride_vn + d_idx * stride_vd,
                           mask=d_idx < D, other=0.0)
             
