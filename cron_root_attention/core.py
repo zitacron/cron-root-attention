@@ -652,10 +652,12 @@ def _cron_root_attn_bwd_dq_only_v14(
     BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
     BLOCK_LOCAL: tl.constexpr, BLOCK_STRIDE: tl.constexpr,
     BLOCK_RELAY: tl.constexpr,
+    KV_GROUPS: tl.constexpr = 1,
 ):
     """
     dQ-only backward kernel with relay support.
     dK/dV computed by separate local + key-centric strided + relay kernels.
+    KV_GROUPS > 1 enables GQA: Q head h reads K/V at head (h // KV_GROUPS).
     """
     b = tl.program_id(0)
     h = tl.program_id(1)
@@ -700,11 +702,11 @@ def _cron_root_attn_bwd_dq_only_v14(
         n_offsets = window_start + n + tl.arange(0, BLOCK_LOCAL)
         n_mask = (n_offsets >= 0) & (n_offsets <= window_end) & (n_offsets < S)
         
-        k_ptr = K + b * stride_kb + h * stride_kh
+        k_ptr = K + b * stride_kb + (h // KV_GROUPS) * stride_kh
         k = tl.load(k_ptr + n_offsets[:, None] * stride_kn + d_idx[None, :] * stride_kd,
                     mask=n_mask[:, None] & (d_idx[None, :] < D), other=0.0)
         
-        v_ptr = V + b * stride_vb + h * stride_vh
+        v_ptr = V + b * stride_vb + (h // KV_GROUPS) * stride_vh
         v = tl.load(v_ptr + n_offsets[:, None] * stride_vn + d_idx[None, :] * stride_vd,
                     mask=n_mask[:, None] & (d_idx[None, :] < D), other=0.0)
         
@@ -732,11 +734,11 @@ def _cron_root_attn_bwd_dq_only_v14(
         n_offsets = stride_indices * SQRT_N
         n_valid = (stride_indices < max_num_strided) & (n_offsets < S)
         
-        k_ptr = K + b * stride_kb + h * stride_kh
+        k_ptr = K + b * stride_kb + (h // KV_GROUPS) * stride_kh
         k = tl.load(k_ptr + n_offsets[:, None] * stride_kn + d_idx[None, :] * stride_kd,
                     mask=n_valid[:, None] & (d_idx[None, :] < D), other=0.0)
         
-        v_ptr = V + b * stride_vb + h * stride_vh
+        v_ptr = V + b * stride_vb + (h // KV_GROUPS) * stride_vh
         v = tl.load(v_ptr + n_offsets[:, None] * stride_vn + d_idx[None, :] * stride_vd,
                     mask=n_valid[:, None] & (d_idx[None, :] < D), other=0.0)
         
@@ -1351,6 +1353,208 @@ def _dkdv_strided_key_centric(
                   dv_acc.to(dV.dtype.element_ty), mask=d_idx < D)
 
 
+# =============================================================================
+# GQA-AWARE SPLIT3 KERNELS  (kv_groups > 1)
+# =============================================================================
+# These are KV-head-centric variants of _dkdv_local_phase and
+# _dkdv_strided_key_centric. By making the CUDA grid index KV heads instead
+# of Q heads, each program exclusively owns a KV-head slice and loops over
+# the KV_GROUPS Q heads that share it — eliminating the kv_groups-fold atomic
+# contention that MHA kernels running under GQA would otherwise produce.
+
+@triton.jit
+def _dkdv_local_phase_gqa(
+    Q, K, V, O, dO, dK, dV, L,
+    stride_qb, stride_qh, stride_qm, stride_qd,
+    stride_kb, stride_kh, stride_kn, stride_kd,
+    stride_vb, stride_vh, stride_vn, stride_vd,
+    stride_ob, stride_oh, stride_om, stride_od,
+    stride_dob, stride_doh, stride_dom, stride_dod,
+    stride_dkb, stride_dkh, stride_dkn, stride_dkd,
+    stride_dvb, stride_dvh, stride_dvn, stride_dvd,
+    stride_lb, stride_lh, stride_lm,
+    S: tl.constexpr, D: tl.constexpr, SQRT_N: tl.constexpr,
+    BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_Q: tl.constexpr,
+    KV_GROUPS: tl.constexpr,
+):
+    """
+    GQA local-only dK/dV: O(N√N) complexity per KV head, zero atomics.
+
+    Grid: (B, H_kv, num_kv_tiles)
+    Each program owns one KV tile and accumulates dK/dV contributions from
+    ALL KV_GROUPS Q heads that share this KV head.  Direct tl.store() — no
+    atomic contention because program_id(1) == h_kv is an exclusive owner of
+    its dK/dV slice.
+    """
+    b      = tl.program_id(0)
+    h_kv   = tl.program_id(1)
+    tile_k = tl.program_id(2)
+
+    k_start   = tile_k * BLOCK_N
+    k_offsets = k_start + tl.arange(0, BLOCK_N)
+    k_mask    = k_offsets < S
+    d_idx     = tl.arange(0, BLOCK_D)
+
+    # Load K, V for this KV-head tile (held in registers throughout)
+    k_ptr = K + b * stride_kb + h_kv * stride_kh
+    keys  = tl.load(k_ptr + k_offsets[:, None] * stride_kn + d_idx[None, :] * stride_kd,
+                    mask=k_mask[:, None] & (d_idx[None, :] < D), other=0.0)
+    v_ptr = V + b * stride_vb + h_kv * stride_vh
+    vals  = tl.load(v_ptr + k_offsets[:, None] * stride_vn + d_idx[None, :] * stride_vd,
+                    mask=k_mask[:, None] & (d_idx[None, :] < D), other=0.0)
+
+    scale     = 1.0 / tl.sqrt(tl.cast(D, tl.float32))
+    dk_acc    = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
+    dv_acc    = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
+
+    # Local query range for this KV tile: [k_start, k_start + BLOCK_N - 1 + SQRT_N - 1]
+    local_q_start = k_start
+    local_q_end   = tl.minimum(k_start + BLOCK_N - 1 + SQRT_N - 1, S - 1)
+
+    # Accumulate from all KV_GROUPS Q heads sharing this KV head
+    for g in range(KV_GROUPS):
+        h_q = h_kv * KV_GROUPS + g
+
+        for q_block in range(0, SQRT_N + BLOCK_N, BLOCK_Q):
+            q_offsets = local_q_start + q_block + tl.arange(0, BLOCK_Q)
+            q_mask    = (q_offsets <= local_q_end) & (q_offsets < S)
+
+            q_ptr = Q + b * stride_qb + h_q * stride_qh
+            q     = tl.load(q_ptr + q_offsets[:, None] * stride_qm + d_idx[None, :] * stride_qd,
+                            mask=q_mask[:, None] & (d_idx[None, :] < D), other=0.0)
+            o_ptr = O + b * stride_ob + h_q * stride_oh
+            o     = tl.load(o_ptr + q_offsets[:, None] * stride_om + d_idx[None, :] * stride_od,
+                            mask=q_mask[:, None] & (d_idx[None, :] < D), other=0.0)
+            do_ptr = dO + b * stride_dob + h_q * stride_doh
+            do    = tl.load(do_ptr + q_offsets[:, None] * stride_dom + d_idx[None, :] * stride_dod,
+                            mask=q_mask[:, None] & (d_idx[None, :] < D), other=0.0)
+            l_ptr = L + b * stride_lb + h_q * stride_lh
+            lse   = tl.load(l_ptr + q_offsets * stride_lm, mask=q_mask, other=0.0)
+
+            scores     = tl.dot(q, tl.trans(keys)) * scale
+            local_mask = (k_offsets[None, :] <= q_offsets[:, None]) & \
+                         (k_offsets[None, :] >= q_offsets[:, None] - SQRT_N + 1)
+            full_mask  = local_mask & k_mask[None, :] & q_mask[:, None]
+            scores     = tl.where(full_mask, scores, float('-inf'))
+
+            p    = tl.exp(scores - lse[:, None])
+            Di   = tl.sum(o * do, axis=1)
+            dov  = tl.dot(do, tl.trans(vals))
+            dp   = p * (dov - Di[:, None])
+            dp   = tl.where(full_mask, dp, 0.0)
+
+            dk_acc += tl.dot(tl.trans(dp.to(q.dtype)), q) * scale
+            dv_acc += tl.dot(tl.trans(p.to(do.dtype)), do)
+
+    # Direct store — this program has exclusive ownership of dK/dV[h_kv][k_start:k_end]
+    dk_ptr = dK + b * stride_dkb + h_kv * stride_dkh
+    tl.store(dk_ptr + k_offsets[:, None] * stride_dkn + d_idx[None, :] * stride_dkd,
+             dk_acc.to(dK.dtype.element_ty),
+             mask=k_mask[:, None] & (d_idx[None, :] < D))
+    dv_ptr = dV + b * stride_dvb + h_kv * stride_dvh
+    tl.store(dv_ptr + k_offsets[:, None] * stride_dvn + d_idx[None, :] * stride_dvd,
+             dv_acc.to(dV.dtype.element_ty),
+             mask=k_mask[:, None] & (d_idx[None, :] < D))
+
+
+@triton.jit
+def _dkdv_strided_key_centric_gqa(
+    Q, K, V, O, dO, dK, dV, L,
+    stride_qb, stride_qh, stride_qm, stride_qd,
+    stride_kb, stride_kh, stride_kn, stride_kd,
+    stride_vb, stride_vh, stride_vn, stride_vd,
+    stride_ob, stride_oh, stride_om, stride_od,
+    stride_dob, stride_doh, stride_dom, stride_dod,
+    stride_dkb, stride_dkh, stride_dkn, stride_dkd,
+    stride_dvb, stride_dvh, stride_dvn, stride_dvd,
+    stride_lb, stride_lh, stride_lm,
+    S: tl.constexpr, D: tl.constexpr, SQRT_N: tl.constexpr,
+    BLOCK_Q: tl.constexpr, BLOCK_D: tl.constexpr,
+    KV_GROUPS: tl.constexpr,
+):
+    """
+    GQA key-centric strided dK/dV.
+
+    Grid: (num_strided_keys, B, H_kv)
+    Each program owns one strided KV position and loops over ALL KV_GROUPS Q
+    heads that share this KV head.  Uses atomic_add to merge with the local
+    phase (which already performed a direct store for this position).
+
+    Since each (h_kv, k_pos) is owned by exactly one program per phase
+    (local=direct-store, strided=atomic_add), there is no cross-program
+    contention within GQA — eliminating the kv_groups×atomics issue.
+    """
+    strided_idx = tl.program_id(0)
+    b           = tl.program_id(1)
+    h_kv        = tl.program_id(2)
+
+    k_pos = strided_idx * SQRT_N
+    if k_pos >= S:
+        return
+
+    d_idx = tl.arange(0, BLOCK_D)
+
+    # Load the key/value we own at this KV head (stays in registers)
+    k_ptr = K + b * stride_kb + h_kv * stride_kh
+    key   = tl.load(k_ptr + k_pos * stride_kn + d_idx * stride_kd,
+                    mask=d_idx < D, other=0.0)
+    v_ptr = V + b * stride_vb + h_kv * stride_vh
+    val   = tl.load(v_ptr + k_pos * stride_vn + d_idx * stride_vd,
+                    mask=d_idx < D, other=0.0)
+
+    dk_acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+    dv_acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+    scale  = 1.0 / tl.sqrt(tl.cast(D, tl.float32))
+
+    # Queries that attend to this strided key: q >= k_pos + SQRT_N
+    q_start = k_pos + SQRT_N
+    if q_start >= S:
+        return
+
+    # Accumulate from all KV_GROUPS Q heads sharing this KV head
+    for g in range(KV_GROUPS):
+        h_q = h_kv * KV_GROUPS + g
+
+        for q_block_start in range(q_start, S, BLOCK_Q):
+            q_offsets  = q_block_start + tl.arange(0, BLOCK_Q)
+            q_mask     = q_offsets < S
+
+            q_ptr  = Q + b * stride_qb + h_q * stride_qh
+            q      = tl.load(q_ptr + q_offsets[:, None] * stride_qm + d_idx[None, :] * stride_qd,
+                             mask=q_mask[:, None] & (d_idx[None, :] < D), other=0.0)
+            o_ptr  = O + b * stride_ob + h_q * stride_oh
+            o      = tl.load(o_ptr + q_offsets[:, None] * stride_om + d_idx[None, :] * stride_od,
+                             mask=q_mask[:, None] & (d_idx[None, :] < D), other=0.0)
+            do_ptr = dO + b * stride_dob + h_q * stride_doh
+            do     = tl.load(do_ptr + q_offsets[:, None] * stride_dom + d_idx[None, :] * stride_dod,
+                             mask=q_mask[:, None] & (d_idx[None, :] < D), other=0.0)
+            l_ptr  = L + b * stride_lb + h_q * stride_lh
+            lse    = tl.load(l_ptr + q_offsets * stride_lm, mask=q_mask, other=0.0)
+
+            scores       = tl.sum(q * key[None, :], axis=1) * scale
+            local_starts = tl.maximum(q_offsets - SQRT_N + 1, 0)
+            strided_mask = (k_pos < local_starts) & q_mask
+            scores       = tl.where(strided_mask, scores, float('-inf'))
+
+            p    = tl.exp(scores - lse)
+            p    = tl.where(strided_mask, p, 0.0)
+            Di   = tl.sum(o * do, axis=1)
+            dov  = tl.sum(do * val[None, :], axis=1)
+            dp   = p * (dov - Di)
+            dp   = tl.where(strided_mask, dp, 0.0)
+
+            dk_acc += tl.sum(dp[:, None] * q, axis=0) * scale
+            dv_acc += tl.sum(p[:, None] * do, axis=0)
+
+    # atomic_add to merge with the local phase's direct store for this position
+    dk_ptr = dK + b * stride_dkb + h_kv * stride_dkh
+    dv_ptr = dV + b * stride_dvb + h_kv * stride_dvh
+    tl.atomic_add(dk_ptr + k_pos * stride_dkn + d_idx * stride_dkd,
+                  dk_acc.to(dK.dtype.element_ty), mask=d_idx < D)
+    tl.atomic_add(dv_ptr + k_pos * stride_dvn + d_idx * stride_dvd,
+                  dv_acc.to(dV.dtype.element_ty), mask=d_idx < D)
+
+
 @triton.jit
 def _dkdv_strided_phase(
     Q, K, V, O, dO, dK, dV, L,
@@ -1888,6 +2092,125 @@ class CronRootAttentionV14Function(torch.autograd.Function):
         # Clone outputs: static buffers are overwritten on next call
         return s_dq.clone(), s_dk.clone(), s_dv.clone()
 
+    # CUDA graph cache for GQA split3 backward.
+    # Key: (B, H_q, H_kv, S, D, KV_GROUPS, BLOCK_M, BLOCK_D, BLOCK_STRIDE,
+    #        BLOCK_LOCAL, device_idx)
+    _split3_gqa_graph_cache: dict = {}
+
+    @staticmethod
+    def _split3_launch_gqa(q, k, v, o, do, L, relay_k, relay_v, dq, dk, dv,
+                           S, D, SQRT_N, BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE,
+                           BLOCK_RELAY, B, H_q, H_kv, KV_GROUPS):
+        """Raw 3-kernel GQA split3 backward (KV-head-centric dK/dV kernels).
+        Used for warmup inside _split3_graphed_gqa; never called on the hot path."""
+        num_tiles_m      = (S + BLOCK_M - 1) // BLOCK_M
+        BLOCK_N, BLOCK_Q = 32, 32
+        num_kv_tiles     = (S + BLOCK_N - 1) // BLOCK_N
+        num_strided      = (S + SQRT_N - 1) // SQRT_N
+        BLOCK_Q_STRIDED  = 64
+
+        # dQ kernel: Q-head-centric, reads K/V at (h_q // KV_GROUPS)
+        _cron_root_attn_bwd_dq_only_v14[(B, H_q, num_tiles_m)](
+            q, k, v, o, do, dq, L,
+            relay_k, relay_v,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+            do.stride(0), do.stride(1), do.stride(2), do.stride(3),
+            dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
+            L.stride(0), L.stride(1), L.stride(2),
+            relay_k.stride(0), relay_k.stride(1), relay_k.stride(2), relay_k.stride(3),
+            relay_v.stride(0), relay_v.stride(1), relay_v.stride(2), relay_v.stride(3),
+            S=S, D=D, SQRT_N=SQRT_N,
+            NUM_RELAY=0, BLOCK_RELAY=BLOCK_RELAY,
+            BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
+            BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
+            KV_GROUPS=KV_GROUPS,
+            num_warps=4, num_stages=1,
+        )
+        # dK/dV local phase: KV-head-centric, direct store (no atomics)
+        _dkdv_local_phase_gqa[(B, H_kv, num_kv_tiles)](
+            q, k, v, o, do, dk, dv, L,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+            do.stride(0), do.stride(1), do.stride(2), do.stride(3),
+            dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
+            dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
+            L.stride(0), L.stride(1), L.stride(2),
+            S=S, D=D, SQRT_N=SQRT_N,
+            BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, BLOCK_Q=BLOCK_Q,
+            KV_GROUPS=KV_GROUPS,
+            num_warps=4, num_stages=1,
+        )
+        # dK/dV strided phase: KV-head-centric, atomic_add merges with local
+        if num_strided > 0:
+            _dkdv_strided_key_centric_gqa[(num_strided, B, H_kv)](
+                q, k, v, o, do, dk, dv, L,
+                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+                k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+                v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+                o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+                do.stride(0), do.stride(1), do.stride(2), do.stride(3),
+                dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
+                dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
+                L.stride(0), L.stride(1), L.stride(2),
+                S=S, D=D, SQRT_N=SQRT_N,
+                BLOCK_Q=BLOCK_Q_STRIDED, BLOCK_D=BLOCK_D,
+                KV_GROUPS=KV_GROUPS,
+                num_warps=4, num_stages=1,
+            )
+
+    @staticmethod
+    def _split3_graphed_gqa(q, k, v, o, do, L, relay_k, relay_v,
+                            S, D, SQRT_N, BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE,
+                            BLOCK_RELAY, B, H_q, H_kv, KV_GROUPS):
+        """GQA split3 backward with CUDA graph replay after first-call JIT warmup.
+
+        Identical lifecycle to _split3_graphed but caches per (B, H_q, H_kv,
+        S, D, KV_GROUPS, ...) and dispatches the KV-head-centric dK/dV kernels.
+        """
+        cache     = CronRootAttentionV14Function._split3_gqa_graph_cache
+        cache_key = (B, H_q, H_kv, S, D, KV_GROUPS,
+                     BLOCK_M, BLOCK_D, BLOCK_STRIDE, BLOCK_LOCAL, q.device.index)
+
+        if cache_key not in cache:
+            s_q  = q.clone();   s_k  = k.clone();  s_v  = v.clone()
+            s_o  = o.clone();   s_do = do.clone(); s_L  = L.clone()
+            s_rk = relay_k.clone(); s_rv = relay_v.clone()
+            s_dq = torch.empty_like(q)
+            s_dk = torch.empty_like(k)
+            s_dv = torch.empty_like(v)
+
+            torch.cuda.synchronize()
+            CronRootAttentionV14Function._split3_launch_gqa(
+                s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv, s_dq, s_dk, s_dv,
+                S, D, SQRT_N, BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE,
+                BLOCK_RELAY, B, H_q, H_kv, KV_GROUPS)
+            torch.cuda.synchronize()
+
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                CronRootAttentionV14Function._split3_launch_gqa(
+                    s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv, s_dq, s_dk, s_dv,
+                    S, D, SQRT_N, BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE,
+                    BLOCK_RELAY, B, H_q, H_kv, KV_GROUPS)
+
+            cache[cache_key] = (g, s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv,
+                                s_dq, s_dk, s_dv)
+
+        g, s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv, s_dq, s_dk, s_dv = \
+            cache[cache_key]
+
+        s_q.copy_(q);  s_k.copy_(k);  s_v.copy_(v)
+        s_o.copy_(o);  s_do.copy_(do); s_L.copy_(L)
+        s_rk.copy_(relay_k); s_rv.copy_(relay_v)
+
+        g.replay()
+        return s_dq.clone(), s_dk.clone(), s_dv.clone()
+
     @staticmethod
     def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                 use_persistent: bool = False, kv_groups: int = 1) -> torch.Tensor:
@@ -2020,6 +2343,8 @@ class CronRootAttentionV14Function(torch.autograd.Function):
         
         use_fused_bwd = (S <= CronRootAttentionV14Function.FUSED_BWD_THRESHOLD)
         
+        # GQA (kv_groups > 1) with relay (S > RELAY_THRESHOLD) is not yet supported
+        # by the long-seq relay kernels.  Short-seq GQA now takes the split3-gqa path.
         if not use_fused_bwd and ctx.kv_groups != 1:
             raise NotImplementedError(
                 f"GQA (kv_groups={ctx.kv_groups}) is only supported for S <= "
@@ -2028,11 +2353,16 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             )
         
         if skip_relay and ctx.kv_groups == 1:
-            # Always use split3: no atomic_add at any S.
-            # Python launch overhead (3× ~50μs) is eliminated by CUDA graph replay.
-            use_split3 = True
+            # MHA: always use split3 (CUDA graph eliminates 3× kernel-launch overhead)
+            use_split3     = True
+            use_split3_gqa = False
+        elif skip_relay:
+            # GQA split3: KV-head-centric kernels — zero kv_groups×atomic contention
+            use_split3     = False
+            use_split3_gqa = True
         else:
-            use_split3 = False
+            use_split3     = False
+            use_split3_gqa = False
 
         if use_split3:
             # =============================================================
@@ -2057,39 +2387,24 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                 S, D, SQRT_N, BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE,
                 BLOCK_RELAY, B, H_q)
 
-        elif use_fused_bwd and skip_relay:
+        elif use_split3_gqa:
             # =============================================================
-            # FULLY-FUSED BACKWARD  (GQA, relay-skip path)
-            # kv_groups > 1 only — MHA takes the split path above.
+            # FAST 3-KERNEL SPLIT BACKWARD  (relay-skip, GQA kv_groups > 1)
             # =============================================================
-            dq = torch.empty_like(q)
-            dk = torch.zeros_like(k)  # Zeros needed: fully-fused uses atomics for all dK/dV
-            dv = torch.zeros_like(v)
-            
-            num_tiles_m = (S + BLOCK_M - 1) // BLOCK_M
-            
-            _cron_root_attn_bwd_fully_fused[(B, H_q, num_tiles_m)](
-                q, k, v, o, do, dq, dk, dv, L,
-                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-                k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-                v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-                o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-                do.stride(0), do.stride(1), do.stride(2), do.stride(3),
-                dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
-                dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
-                dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
-                L.stride(0), L.stride(1), L.stride(2),
-                S=S, D=D, SQRT_N=SQRT_N,
-                BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
-                BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
-                KV_GROUPS=ctx.kv_groups,
-                num_warps=4, num_stages=1,
-            )
-            
-            # No relay scatter needed — skip_relay=True
+            # KV-head-centric dK/dV kernels eliminate the kv_groups×atomics
+            # that fully_fused (Q-head-centric) would produce for GQA.
+            # Local phase: direct tl.store() — exclusive KV-tile ownership.
+            # Strided phase: atomic_add to merge with local (only one writer).
+            # CUDA graph amortises 3× Python kernel-launch overhead to ~5μs.
+            # =============================================================
+            dq, dk, dv = CronRootAttentionV14Function._split3_graphed_gqa(
+                q, k, v, o, do, L, relay_k, relay_v,
+                S, D, SQRT_N, BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE,
+                BLOCK_RELAY, B, H_q, H_kv, ctx.kv_groups)
+
         else:
             # =============================================================
-            # STANDARD 4-KERNEL BACKWARD (with relay)
+            # STANDARD 4-KERNEL BACKWARD (with relay, MHA only)
             # =============================================================
             dq = torch.empty_like(q)
             dk = torch.zeros_like(k)  # Zero for atomic accumulation
