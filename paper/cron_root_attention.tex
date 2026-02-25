@@ -23,7 +23,7 @@
 \maketitle
 
 \begin{abstract}
-We introduce Cron Root Attention, a sparse attention mechanism that reduces the computational complexity of self-attention from $O(N^2)$ to $O(N\sqrt{N})$ while preserving causal language modeling semantics. Our method combines three phases: (1) a local sliding window of size $\sqrt{N}$, (2) a strided global window of size $\sqrt{N}$, and (3) a \textbf{relay mechanism} that carries block-mean compressed key/value summaries from $\sqrt{N}$ blocks, enabling full-sequence coverage through a single softmax pass. Each query attends to $O(3\sqrt{N})$ positions, achieving 100\% token coverage without gradient dilution. We implement optimized Triton kernels with a fully-fused single-kernel backward pass and relay-skip optimization that achieve up to \textbf{81x forward kernel speedup} at sequence length 524K and \textbf{7.4x end-to-end training speedup} at 131K tokens, with forward crossover at $\sim$2K tokens and training crossover at $\sim$2K tokens. All benchmarks were conducted on a single NVIDIA RTX 5070 Ti (Blackwell GB203, SM 12.0) using PyTorch 2.9.1, CUDA 12.8, Triton 3.5.1, and FP16 precision. Our implementation supports 40+ GPU models from consumer (RTX 20/30/40/50 series) to datacenter (H100, H800, A100, V100) hardware with automatic SM detection. We release Cron Root Attention as an open-source pip package under Apache 2.0 license.
+We introduce Cron Root Attention, a sparse attention mechanism that reduces the computational complexity of self-attention from $O(N^2)$ to $O(N\sqrt{N})$ while preserving causal language modeling semantics. Our method combines three phases: (1) a local sliding window of size $\sqrt{N}$, (2) a strided global window of size $\sqrt{N}$, and (3) a \textbf{relay mechanism} that carries block-mean compressed key/value summaries from $\sqrt{N}$ blocks, enabling full-sequence coverage through a single softmax pass. Each query attends to $O(3\sqrt{N})$ positions, achieving 100\% token coverage without gradient dilution. We implement optimized Triton kernels with a fully-fused single-kernel backward pass and relay-skip optimization that achieve up to \textbf{79x forward kernel speedup} at sequence length 524K and \textbf{3.6x end-to-end training speedup} at 131K tokens, with forward crossover at $\sim$2K tokens and training crossover at $\sim$2K tokens. All benchmarks were conducted on a single NVIDIA RTX 5070 Ti (Blackwell GB203, SM 12.0) using PyTorch 2.9.1, CUDA 12.8, Triton 3.5.1, and FP16 precision. Our implementation supports 40+ GPU models from consumer (RTX 20/30/40/50 series) to datacenter (H100, H800, A100, V100) hardware with automatic SM detection. We release Cron Root Attention as an open-source pip package under Apache 2.0 license.
 \end{abstract}
 
 \section{Introduction}
@@ -42,8 +42,8 @@ yields $O(N\sqrt{N})$ total complexity while providing \textbf{100\% sequence co
 
 \begin{itemize}
     \item We formalize the $\sqrt{N}$ attention pattern and prove its $O(N\sqrt{N})$ complexity with 2-hop universal reachability (Section \ref{sec:method}).
-    \item We develop block-query tiled Triton kernels with a fully-fused single-kernel backward achieving 81x forward speedup at 524K tokens (Section \ref{sec:implementation}).
-    \item We demonstrate \textbf{7.4x} end-to-end training speedup at 131K sequence length with training crossover at $\sim$2K tokens (Section \ref{sec:experiments}).
+    \item We develop block-query tiled Triton kernels with a fully-fused single-kernel backward achieving 79x forward speedup at 524K tokens (Section \ref{sec:implementation}).
+    \item We demonstrate \textbf{3.6x} end-to-end training speedup at 131K sequence length with training crossover at $\sim$2K tokens (Section \ref{sec:experiments}).
     \item We release a pip-installable package with automatic GPU detection supporting 40+ GPU models (Section \ref{sec:code}).
 \end{itemize}
 
@@ -234,25 +234,27 @@ All benchmarks were conducted on the following hardware and software configurati
 \toprule
 Seq Length & SDPA/Flash (ms) & Cron Root (ms) & Speedup \\
 \midrule
-512 & 0.024 & 0.044 & 0.54x \\
-1,024 & 0.038 & 0.044 & 0.86x \\
-2,048 & 0.108 & 0.060 & 1.80x \\
-4,096 & 0.287 & 0.062 & 4.63x \\
-8,192 & 0.917 & 0.102 & 9.03x \\
-16,384 & 3.42 & 0.273 & 12.55x \\
-32,768 & 13.2 & 0.955 & 13.78x \\
-65,536 & 51.3 & 1.69 & 30.39x \\
-131,072 & 202 & 6.02 & 33.61x \\
-262,144 & 769 & 12.7 & 60.39x \\
-524,288 & 3193 & 39.4 & \textbf{80.99x} \\
+512 & 0.024 & 0.045 & 0.53x \\
+1,024 & 0.040 & 0.046 & 0.86x \\
+2,048 & 0.112 & 0.058 & 1.95x \\
+4,096 & 0.290 & 0.068 & 4.27x \\
+8,192 & 0.916 & 0.103 & 8.90x \\
+16,384 & 3.27 & 0.288 & 11.34x \\
+32,768 & 12.1 & 0.953 & 12.67x \\
+65,536 & 46.5 & 1.68 & 27.65x \\
+131,072 & 185 & 5.69 & 32.40x \\
+262,144 & 736 & 11.8 & 62.31x \\
+524,288 & 2985 & 38.0 & \textbf{78.63x} \\
 \bottomrule
 \end{tabular}
 \label{tab:kernel}
 \end{table}
 
-The subquadratic scaling is evident: at 524K tokens, Cron Root Attention is 81x faster than SDPA (which uses FlashAttention-2 as its backend), demonstrating the $O(N\sqrt{N})$ vs $O(N^2)$ complexity difference. The forward crossover is approximately 2K tokens. For training (forward + backward), the crossover is also approximately 2K tokens thanks to the fully-fused single-kernel backward optimization.
+The subquadratic scaling is evident: at 524K tokens, Cron Root Attention is 79x faster than SDPA (which uses FlashAttention-2 as its backend), demonstrating the $O(N\sqrt{N})$ vs $O(N^2)$ complexity difference. The forward crossover is approximately 2K tokens. For training (forward + backward), the crossover is also approximately 2K tokens thanks to the fully-fused single-kernel backward optimization.
 
-\textbf{Non-monotonic speedup at S=131K.} A notable irregularity is the speedup at S=131,072 (33.61x), which is lower than the linear interpolation between S=65,536 (30.39x) and S=262,144 (60.39x) would suggest. This is not a measurement artifact but a consequence of $\sqrt{N}$ alignment. The window size $W = \lceil\sqrt{N}\rceil$ yields $W=363$ for $N=131{,}072$, a non-power-of-2 value, while adjacent benchmarks yield perfect powers of two ($W=256$ at $N=65{,}536$ and $W=512$ at $N=262{,}144$). This causes three compounding penalties:
+\textbf{Launch-overhead floor at small S.} Cron Root Attention reports a near-constant $\sim$0.046\,ms for both $S{=}512$ and $S{=}1{,}024$, and 0.058--0.068\,ms for $S{=}2{,}048$ and $S{=}4{,}096$. This is not an error: at these short sequence lengths the actual attention compute is negligible ($\sqrt{512} = 23$ attend positions per query), and the measured time is dominated by the \emph{fixed-cost floor} of the Triton persistent kernel launch --- grid setup, work-queue initialization, SRAM allocation, and the GPU kernel dispatch overhead itself. The kernel does no more arithmetic at $S{=}512$ than at $S{=}1{,}024$ (both fit within one work unit of the persistent grid with $B_M{=}64$), so the two measure nearly identically. SDPA/FlashAttention-2 has a lower launch floor ($\sim$0.024\,ms) because its CUDA-native implementation avoids the Triton JIT dispatcher overhead. The result is that Cron Root is slower below $\sim$2K tokens, after which the $O(N\sqrt{N})$ vs $O(N^2)$ compute gap overtakes the fixed launch differential.
+
+\textbf{Sub-linear speedup growth at S=131K.} The forward speedup at S=131,072 (32.40x) is only marginally above S=65,536 (27.65x), despite a $2\times$ increase in sequence length --- well below the 62.31x at S=262,144. The speedup is still \emph{monotonically increasing} throughout; it is the \emph{rate of growth} that stalls at 131K. This slowdown is a consequence of $\sqrt{N}$ alignment. The window size $W = \lceil\sqrt{N}\rceil$ yields $W=363$ for $N=131{,}072$, a non-power-of-2 value, while adjacent benchmarks yield perfect powers of two ($W=256$ at $N=65{,}536$ and $W=512$ at $N=262{,}144$). This causes three compounding penalties:
 
 \begin{enumerate}
     \item \textbf{Loop tiling waste}: The kernel iterates in blocks of 64 (BLOCK\_M). With $W=363$, the inner loop requires $\lceil(363{+}64)/64\rceil = 7$ iterations per tile vs 5 for $W=256$, and $N=131{,}072$ requires $2\times$ more total tiles than $N=65{,}536$ --- yielding $2 \times 7/5 = 2.8\times$ the theoretical tile work (vs a $2\times$ increase for the $4\times$ larger $N=262{,}144$ which has $W=512$, i.e., 9 iterations per tile but $2\times$ tiles).
@@ -260,7 +262,7 @@ The subquadratic scaling is evident: at 524K tokens, Cron Root Attention is 81x 
     \item \textbf{Relay tensor misalignment}: The relay dimensions $362 \times 363$ are both non-aligned, causing suboptimal memory access patterns compared to the clean $256 \times 256$ and $512 \times 512$ layouts at adjacent sequence lengths.
 \end{enumerate}
 
-All three penalties compound simultaneously at $S=131{,}072$ specifically. At $S=262{,}144$, $W=512$ is a perfect power of two and the speedup recovers to 60.39x. A potential optimization is rounding $W$ to the next power of two, trading $O(\sqrt{N})$ extra attend positions ($<$41\% overhead at 131K) for aligned tiling, though this would change the attention pattern semantics.
+All three penalties compound simultaneously at $S=131{,}072$ specifically. At $S=262{,}144$, $W=512$ is a perfect power of two and the speedup recovers to 62.31x. A potential optimization is rounding $W$ to the next power of two, trading $O(\sqrt{N})$ extra attend positions ($<$41\% overhead at 131K) for aligned tiling, though this would change the attention pattern semantics.
 
 \subsection{End-to-End Training Performance}
 
@@ -271,25 +273,23 @@ All three penalties compound simultaneously at $S=131{,}072$ specifically. At $S
 \toprule
 Seq Length & Cron Root Fwd+Bwd (ms) & SDPA Fwd+Bwd (ms) & Speedup \\
 \midrule
-512 & 0.185 & 0.113 & 0.61x \\
-1K & 0.213 & 0.160 & 0.75x \\
-2K & 0.283 & 0.341 & 1.21x \\
-4K & 0.452 & 0.916 & 2.03x \\
-8K & 0.922 & 3.07 & 3.32x \\
-16K & 9.33 & 12.48 & 1.34x \\
-32K & 24.64 & 43.50 & 1.77x \\
-64K & 64.81 & 170.37 & 2.63x \\
-128K & 192.20 & 1421.9 & \textbf{7.4x} \\
+512 & 0.224 & 0.134 & 0.60x \\
+1K & 0.228 & 0.164 & 0.72x \\
+2K & 0.299 & 0.344 & 1.15x \\
+4K & 0.503 & 0.920 & 1.83x \\
+8K & 0.946 & 2.91 & 3.07x \\
+16K & 8.47 & 10.82 & 1.28x \\
+32K & 23.66 & 41.67 & 1.76x \\
+64K & 63.51 & 163.18 & 2.57x \\
+128K & 178.0 & 648.6 & \textbf{3.64x} \\
 \bottomrule
 \end{tabular}
 \label{tab:training}
 \end{table}
 
-Training speedup increases with sequence length due to the quadratic vs subquadratic scaling gap. At 131K tokens, we achieve \textbf{7.4x} end-to-end speedup. For sequences $\leq$ 8K tokens, we use a \textbf{fully-fused single-kernel backward} that computes dQ, local dK/dV, and strided dK/dV in one kernel launch (with atomic\_add for K/V gradient accumulation), achieving up to 3.32x speedup at 8K. For sequences $>$ 8K, we use the \textbf{atomic-free 3-kernel split backward}: separate zero-atomic kernels for dQ, dK/dV, and relay dK/dV, eliminating inter-warp atomic contention and delivering approximately $2\times$ backward throughput improvement over the previous implementation at these sequence lengths.
+Training speedup increases with sequence length due to the quadratic vs subquadratic scaling gap. At 131K tokens, we achieve \textbf{3.64x} end-to-end speedup. For sequences $\leq$ 8K tokens, we use a \textbf{fully-fused single-kernel backward} that computes dQ, local dK/dV, and strided dK/dV in one kernel launch (with atomic\_add for K/V gradient accumulation), achieving up to 3.07x speedup at 8K. For sequences $>$ 8K, we use the \textbf{atomic-free 3-kernel split backward}: separate zero-atomic kernels for dQ, dK/dV, and relay dK/dV, eliminating inter-warp atomic contention and delivering approximately $2\times$ backward throughput improvement over the previous implementation at these sequence lengths.
 
-\textbf{Training dip at S=16K.} At the 8K$\to$16K transition, the backward switches from the fully-fused single-kernel to the atomic-free 3-kernel split strategy. This causes a visible throughput dip from 3.32x at 8K to 1.34x at 16K. Two factors contribute: (1) the multi-kernel launch overhead is amortized poorly at 16K because the per-kernel work is still relatively small, and (2) the relay mechanism activates for $S > 8{,}192$, adding the relay precompute (pad, reshape, mean) and a separate backward kernel for relay dK/dV gradients. As sequence length increases beyond 16K, the subquadratic compute advantage dominates these fixed costs and the speedup resumes its upward trajectory (1.77x at 32K, 2.63x at 64K, 7.4x at 128K).
-
-\textbf{Super-quadratic SDPA degradation at S=131K.} A notable feature of the training results is that SDPA degrades faster than $O(N^2)$ at the 64K$\to$131K transition: SDPA increases from 170~ms at 64K to 1422~ms at 131K ($8.4\times$ increase), whereas pure $O(N^2)$ scaling would predict only a $4\times$ increase. Cron Root Attention, by contrast, scales from 64.8~ms to 192~ms ($2.97\times$). This divergence is the primary reason the training speedup jumps from 2.63x at 64K to 7.4x at 128K, rather than increasing gradually. We attribute the SDPA degradation to an internal memory buffer exhaustion in FlashAttention-2's backward pass at this sequence length on the RTX 5070 Ti, forcing a slower fallback path. Cron Root Attention is unaffected because its sub-quadratic footprint keeps all working tensors well within the L2 cache working set.
+\textbf{Training dip at S=16K.} At the 8K$\to$16K transition, the backward switches from the fully-fused single-kernel to the atomic-free 3-kernel split strategy. This causes a visible throughput dip from 3.07x at 8K to 1.28x at 16K. Two factors contribute: (1) the multi-kernel launch overhead is amortized poorly at 16K because the per-kernel work is still relatively small, and (2) the relay mechanism activates for $S > 8{,}192$, adding the relay precompute (pad, reshape, mean) and a separate backward kernel for relay dK/dV gradients. As sequence length increases beyond 16K, the subquadratic compute advantage dominates these fixed costs and the speedup resumes its upward trajectory (1.76x at 32K, 2.57x at 64K, 3.64x at 128K).
 
 For longer sequences, we use four specialized zero-atomic kernels. A hybrid mode auto-selects SDPA for S $<$ 1536 and Cron Root for S $\geq$ 1536, guaranteeing $\geq$1.0x speedup at all sequence lengths.
 
@@ -302,25 +302,24 @@ For longer sequences, we use four specialized zero-atomic kernels. A hybrid mode
 \toprule
 Seq Length & SDPA (ms) & Cron Root (ms) & Speedup \\
 \midrule
-512 & 0.019 & 0.010 & 1.94x \\
-1,024 & 0.035 & 0.013 & 2.73x \\
-2,048 & 0.111 & 0.022 & 4.98x \\
-4,096 & 0.292 & 0.035 & 8.31x \\
-8,192 & 0.942 & 0.078 & 12.01x \\
-16,384 & 5.66 & 0.280 & 20.24x \\
-32,768 & 26.4 & 0.960 & 27.49x \\
-65,536 & 101.8 & 1.71 & 59.42x \\
-131,072 & 404.7 & 10.4 & 38.82x \\
-262,144 & 1609 & 23.6 & 68.20x \\
-524,288 & 6495 & 80.9 & \textbf{80.29x} \\
+512 & 0.025 & 0.046 & 0.54x \\
+1,024 & 0.037 & 0.050 & 0.75x \\
+2,048 & 0.110 & 0.050 & 2.21x \\
+4,096 & 0.292 & 0.068 & 4.27x \\
+8,192 & 0.917 & 0.108 & 8.52x \\
+16,384 & 3.29 & 0.279 & 11.82x \\
+32,768 & 12.1 & 0.954 & 12.70x \\
+65,536 & 46.9 & 1.70 & 27.60x \\
+131,072 & 185 & 5.71 & 32.45x \\
+262,144 & 737 & 11.8 & 62.35x \\
+524,288 & 2986 & 38.1 & \textbf{78.41x} \\
 \bottomrule
 \end{tabular}
 \label{tab:inference}
 \end{table}
 
-Under \texttt{torch.no\_grad()} inference, Cron Root Attention is faster than SDPA at \textbf{all} tested sequence lengths, including S=512 (1.94x). This contrasts with the forward-pass kernel benchmarks (Table~\ref{tab:kernel}), where crossover occurs at $\sim$2K. The difference is explained by the \texttt{no\_grad} code path: when gradients are not required, the kernel skips saving activations (output, logsumexp) needed for the backward pass, reducing memory allocation overhead. At small sequence lengths where kernel compute is negligible, this memory overhead dominates, giving Cron Root Attention a structural advantage even below the compute crossover point.
-
-The same $\sqrt{N}$-alignment dip observed in forward pass benchmarks appears at S=131,072 (38.82x vs 59.42x at 65K and 68.20x at 262K), consistent with the non-power-of-2 window size analysis in Section~\ref{sec:experiments}.
+Under \texttt{torch.no\_grad()} inference, Cron Root Attention exhibits performance characteristics nearly identical to the forward-pass kernel benchmarks (Table~\ref{tab:kernel}), with a crossover at $\sim$2K tokens and a peak speedup of \textbf{78.41x} at 524K. This is expected: the Triton kernels execute identically regardless of PyTorch's autograd context, so \texttt{no\_grad()} only eliminates the negligible overhead of building the computation graph. The same $\sqrt{N}$-alignment slowdown at S=131,072 (32.45x, up from 27.60x at 65K) is present, recovering to 62.35x at S=262,144 ($W=512$, a perfect power of two).
+\label{sec:inference}
 
 \subsection{Correctness Validation}
 
@@ -386,7 +385,7 @@ Datacenter & H100, H200, H800, A100, L40S, L4, V100, B100, B200 \\
 
 \section{Conclusion}
 
-Cron Root Attention achieves true subquadratic scaling ($O(N\sqrt{N})$) with practical speedups up to 81x for forward passes and \textbf{7.4x} for complete training at long sequence lengths. Our 3-phase architecture (local + strided + relay) provides 100\% sequence coverage through a single softmax pass, eliminating the gradient dilution problem that plagues multi-hop sparse attention. The fully-fused single-kernel backward (for $S \leq 8$K) achieves up to 3.32x training speedup, while the atomic-free 3-kernel split backward (for $S > 8$K) scales to 7.4x at 131K tokens by eliminating inter-warp atomic contention. A notable property is that SDPA degrades super-quadratically at $S=131$K on this hardware, amplifying the speedup at that sequence length. A hybrid mode auto-selects SDPA below the crossover point, guaranteeing $\geq$1.0x speedup at all sequence lengths. All benchmarks were conducted on a single RTX 5070 Ti (Blackwell, SM~12.0) running PyTorch 2.9.1 + CUDA 12.8 + Triton 3.5.1; see Section~\ref{sec:setup} for the complete experimental setup. The pip-installable package provides drop-in replacement modules for immediate adoption in long-context LLM training and inference.
+Cron Root Attention achieves true subquadratic scaling ($O(N\sqrt{N})$) with practical speedups up to 79x for forward passes and \textbf{3.6x} for complete training at long sequence lengths. Our 3-phase architecture (local + strided + relay) provides 100\% sequence coverage through a single softmax pass, eliminating the gradient dilution problem that plagues multi-hop sparse attention. The fully-fused single-kernel backward (for $S \leq 8$K) achieves up to 3.07x training speedup, while the atomic-free 3-kernel split backward (for $S > 8$K) scales to 3.64x at 131K tokens by eliminating inter-warp atomic contention. A hybrid mode auto-selects SDPA below the crossover point, guaranteeing $\geq$1.0x speedup at all sequence lengths. All benchmarks were conducted on a single RTX 5070 Ti (Blackwell, SM~12.0) running PyTorch 2.9.1 + CUDA 12.8 + Triton 3.5.1; see Section~\ref{sec:setup} for the complete experimental setup. The pip-installable package provides drop-in replacement modules for immediate adoption in long-context LLM training and inference.
 
 \section*{Acknowledgments}
 

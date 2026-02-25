@@ -27,9 +27,9 @@ Supported GPUs:
 
 Performance (RTX 5070 Ti, FP16, verified warm-start benchmarks):
 - Forward pass speedup vs SDPA (Small model H=8, D=64):
-  S=2K: 1.80x, S=4K: 4.63x, S=8K: 9.03x, S=64K: 30.4x, S=512K: 81.0x
+  S=2K: 1.95x, S=4K: 4.27x, S=8K: 8.90x, S=64K: 27.7x, S=512K: 78.6x
 - Training (fwd+bwd) speedup:
-  S=4K: 2.03x, S=8K: 3.32x, S=64K: 2.63x, S=128K: 3.70x
+  S=4K: 1.83x, S=8K: 3.07x, S=64K: 2.57x, S=128K: 3.64x
 - Crossover: ~2K (forward and training)
 - Cold start: ~221ms first call (Triton JIT), <2ms thereafter
 
@@ -2051,29 +2051,49 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                      q.device.index)
 
         if cache_key not in cache:
-            # ── Allocate static (fixed-address) I/O buffers ───────────────
-            s_q  = q.clone();   s_k  = k.clone();  s_v  = v.clone()
-            s_o  = o.clone();   s_do = do.clone(); s_L  = L.clone()
-            s_rk = relay_k.clone(); s_rv = relay_v.clone()
-            s_dq = torch.empty_like(q)
-            s_dk = torch.empty_like(k)
-            s_dv = torch.empty_like(v)
+            # Pipeline-parallel fix: q may live on cuda:1 while Python's current
+            # device is cuda:0.  Two separate streams are needed:
+            #   _wup_stream (default)  – Triton warmup; Triton reads
+            #                            torch.cuda.current_stream() so it must
+            #                            be the default stream for q.device.
+            #   _cap_stream (non-default) – CUDAGraph capture; PyTorch requires
+            #                              capture on a non-default stream.
+            # Replay is submitted via g.replay() on the default stream (allowed).
+            _wup_stream = torch.cuda.default_stream(q.device)
+            _cap_stream = torch.cuda.Stream(device=q.device)
 
-            # ── Warmup: JIT-compile Triton kernels outside capture ─────────
-            torch.cuda.synchronize()
-            CronRootAttentionV14Function._split3_launch(
-                s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv, s_dq, s_dk, s_dv,
-                S, D, SQRT_N, BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE,
-                BLOCK_RELAY, B, H_q)
-            torch.cuda.synchronize()
+            with torch.cuda.stream(_wup_stream):
+                # ── Allocate static (fixed-address) I/O buffers ───────────────
+                s_q  = q.clone();   s_k  = k.clone();  s_v  = v.clone()
+                s_o  = o.clone();   s_do = do.clone(); s_L  = L.clone()
+                s_rk = relay_k.clone(); s_rv = relay_v.clone()
+                s_dq = torch.empty_like(q)
+                s_dk = torch.empty_like(k)
+                s_dv = torch.empty_like(v)
 
-            # ── Capture: record kernel sequence as a single replayable graph ─
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g):
+                # ── Warmup: JIT-compile Triton kernels outside capture ─────────
+                _wup_stream.synchronize()
                 CronRootAttentionV14Function._split3_launch(
                     s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv, s_dq, s_dk, s_dv,
                     S, D, SQRT_N, BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE,
                     BLOCK_RELAY, B, H_q)
+                _wup_stream.synchronize()
+
+            # ── Capture: non-default stream required by PyTorch ───────────────
+            with torch.cuda.stream(_cap_stream):
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, stream=_cap_stream):
+                    CronRootAttentionV14Function._split3_launch(
+                        s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv, s_dq, s_dk, s_dv,
+                        S, D, SQRT_N, BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE,
+                        BLOCK_RELAY, B, H_q)
+            # Sync before storing cache: CUDA graph capture also executes kernels
+            # once on _cap_stream (JIT compilation dry-run), which READS
+            # s_q/s_k/s_v.  Without this sync, the replay path immediately calls
+            # s_q.copy_() on default_stream while _cap_stream is still reading
+            # s_q → concurrent READ+WRITE on same GPU memory →
+            # cudaErrorIllegalAddress.  This sync fires only once per unique shape.
+            _cap_stream.synchronize()
 
             cache[cache_key] = (g, s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv,
                                 s_dq, s_dk, s_dv)
@@ -2081,16 +2101,13 @@ class CronRootAttentionV14Function(torch.autograd.Function):
         g, s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv, s_dq, s_dk, s_dv = \
             cache[cache_key]
 
-        # ── Copy live inputs into static buffers (device→device, ~0.01ms at S=128)
-        s_q.copy_(q);  s_k.copy_(k);  s_v.copy_(v)
-        s_o.copy_(o);  s_do.copy_(do); s_L.copy_(L)
-        s_rk.copy_(relay_k); s_rv.copy_(relay_v)
-
-        # ── Replay: single CUDA API call, ~5μs CPU overhead ────────────────
-        g.replay()
-
-        # Clone outputs: static buffers are overwritten on next call
-        return s_dq.clone(), s_dk.clone(), s_dv.clone()
+        # Replay on default stream for q's device (copies + replay sequenced).
+        with torch.cuda.stream(torch.cuda.default_stream(q.device)):
+            s_q.copy_(q);  s_k.copy_(k);  s_v.copy_(v)
+            s_o.copy_(o);  s_do.copy_(do); s_L.copy_(L)
+            s_rk.copy_(relay_k); s_rv.copy_(relay_v)
+            g.replay()
+            return s_dq.clone(), s_dk.clone(), s_dv.clone()
 
     # CUDA graph cache for GQA split3 backward.
     # Key: (B, H_q, H_kv, S, D, KV_GROUPS, BLOCK_M, BLOCK_D, BLOCK_STRIDE,
@@ -2177,26 +2194,39 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                      BLOCK_M, BLOCK_D, BLOCK_STRIDE, BLOCK_LOCAL, q.device.index)
 
         if cache_key not in cache:
-            s_q  = q.clone();   s_k  = k.clone();  s_v  = v.clone()
-            s_o  = o.clone();   s_do = do.clone(); s_L  = L.clone()
-            s_rk = relay_k.clone(); s_rv = relay_v.clone()
-            s_dq = torch.empty_like(q)
-            s_dk = torch.empty_like(k)
-            s_dv = torch.empty_like(v)
+            # Same two-stream fix as _split3_graphed (MHA version above):
+            # warmup on default stream (Triton requirement), capture on a
+            # dedicated non-default stream (PyTorch CUDAGraph requirement),
+            # replay on default stream (explicitly allowed by PyTorch).
+            _wup_stream = torch.cuda.default_stream(q.device)
+            _cap_stream = torch.cuda.Stream(device=q.device)
 
-            torch.cuda.synchronize()
-            CronRootAttentionV14Function._split3_launch_gqa(
-                s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv, s_dq, s_dk, s_dv,
-                S, D, SQRT_N, BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE,
-                BLOCK_RELAY, B, H_q, H_kv, KV_GROUPS)
-            torch.cuda.synchronize()
+            with torch.cuda.stream(_wup_stream):
+                s_q  = q.clone();   s_k  = k.clone();  s_v  = v.clone()
+                s_o  = o.clone();   s_do = do.clone(); s_L  = L.clone()
+                s_rk = relay_k.clone(); s_rv = relay_v.clone()
+                s_dq = torch.empty_like(q)
+                s_dk = torch.empty_like(k)
+                s_dv = torch.empty_like(v)
 
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g):
+                _wup_stream.synchronize()
                 CronRootAttentionV14Function._split3_launch_gqa(
                     s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv, s_dq, s_dk, s_dv,
                     S, D, SQRT_N, BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE,
                     BLOCK_RELAY, B, H_q, H_kv, KV_GROUPS)
+                _wup_stream.synchronize()
+
+            with torch.cuda.stream(_cap_stream):
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, stream=_cap_stream):
+                    CronRootAttentionV14Function._split3_launch_gqa(
+                        s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv, s_dq, s_dk, s_dv,
+                        S, D, SQRT_N, BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE,
+                        BLOCK_RELAY, B, H_q, H_kv, KV_GROUPS)
+            # Same sync as _split3_graphed: wait for _cap_stream to finish the
+            # capture-time execution before default_stream copy_()s new inputs
+            # into s_q/s_k/s_v → prevents concurrent READ+WRITE race.
+            _cap_stream.synchronize()
 
             cache[cache_key] = (g, s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv,
                                 s_dq, s_dk, s_dv)
@@ -2204,12 +2234,12 @@ class CronRootAttentionV14Function(torch.autograd.Function):
         g, s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv, s_dq, s_dk, s_dv = \
             cache[cache_key]
 
-        s_q.copy_(q);  s_k.copy_(k);  s_v.copy_(v)
-        s_o.copy_(o);  s_do.copy_(do); s_L.copy_(L)
-        s_rk.copy_(relay_k); s_rv.copy_(relay_v)
-
-        g.replay()
-        return s_dq.clone(), s_dk.clone(), s_dv.clone()
+        with torch.cuda.stream(torch.cuda.default_stream(q.device)):
+            s_q.copy_(q);  s_k.copy_(k);  s_v.copy_(v)
+            s_o.copy_(o);  s_do.copy_(do); s_L.copy_(L)
+            s_rk.copy_(relay_k); s_rv.copy_(relay_v)
+            g.replay()
+            return s_dq.clone(), s_dk.clone(), s_dv.clone()
 
     @staticmethod
     def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -2326,6 +2356,20 @@ class CronRootAttentionV14Function(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do: torch.Tensor):
         q, k, v, o, L, relay_k, relay_v = ctx.saved_tensors
+        # ── Diagnostic: surface async Triton forward errors at a Python frame ─
+        # This synchronize() converts any deferred cudaErrorIllegalAddress from
+        # the forward Triton kernels into a synchronous Python RuntimeError with
+        # a proper traceback (instead of in TensorImpl::~TensorImpl).
+        # NOTE: synchronize(device) does NOT change current_device — safe for FP8.
+        # Remove once the crash root cause is identified.
+        torch.cuda.synchronize(q.device)
+        # ─────────────────────────────────────────────────────────────────────
+        # NOTE: do NOT call torch.cuda.set_device(q.device) here.  It is a
+        # non-context-manager call that permanently changes the global current
+        # device, poisoning downstream TE/FP8 CUBLAS workspace references and
+        # causing cudaErrorIllegalAddress in TensorImpl::~TensorImpl.
+        # Device context for CUDAGraph capture + Triton dispatch is handled
+        # correctly by torch.cuda.stream() inside _split3_graphed/_split3_graphed_gqa.
         B, H_q, S, D = q.shape
         H_kv = k.shape[1]  # H_q // kv_groups
         SQRT_N = ctx.SQRT_N
@@ -2498,6 +2542,9 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                 d_relay_v_expanded = d_relay_v_expanded.reshape(B, H_kv, NUM_RELAY * SQRT_N, D)
                 dv[:, :, :S, :] += d_relay_v_expanded[:, :, :S, :]
         
+        # ── Diagnostic: surface any backward Triton/graph errors here ─────
+        torch.cuda.synchronize(dq.device)
+        # ─────────────────────────────────────────────────────────────────────
         return dq, dk, dv, None, None  # extra None for kv_groups arg
 
 
