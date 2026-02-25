@@ -26,11 +26,11 @@ Supported GPUs:
 - Auto-detection via torch.cuda.get_device_properties()
 
 Performance (RTX 5070 Ti, FP16, verified warm-start benchmarks):
-- Forward pass speedup vs SDPA (multiple model sizes):
-  Small (H=8, D=64):    S=4K: 4.8x, S=64K: 20.6x, S=512K: 58.4x
-  Large (H=16, D=128):  S=4K: 6.9x, S=64K: 24.2x, S=512K: 67.8x
-  XL (H=32, D=128):     S=4K: 7.3x, S=64K: 24.0x, S=256K: 51.4x
-- Crossover: ~2K (small), ~1K (large), ~512 (XL)
+- Forward pass speedup vs SDPA (Small model H=8, D=64):
+  S=2K: 1.80x, S=4K: 4.63x, S=8K: 9.03x, S=64K: 30.4x, S=512K: 81.0x
+- Training (fwd+bwd) speedup:
+  S=4K: 2.03x, S=8K: 3.32x, S=64K: 2.63x, S=128K: 3.70x
+- Crossover: ~2K (forward and training)
 - Cold start: ~221ms first call (Triton JIT), <2ms thereafter
 
 (c) 2026 Zitacron. All rights reserved.

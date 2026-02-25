@@ -3,7 +3,7 @@ Cron Root Attention - Sub-quadratic Attention for Long-Context Transformers
 ============================================================================
 
 A high-performance Triton implementation of √N sparse attention achieving
-O(N√N) complexity instead of O(N²), enabling up to 68x forward kernel speedups
+O(N√N) complexity instead of O(N²), enabling up to 81x forward kernel speedups
 at long sequence lengths (higher for larger models).
 
 (c) 2026 Zitacron. All rights reserved.
@@ -25,13 +25,13 @@ Supported GPUs:
 
 Key Results (RTX 5070 Ti, FP16, PyTorch 2.9.1 + CUDA 12.8):
     Forward pass — Small model (H=8, D=64):
-        S=512:    0.59x vs SDPA  (crossover ~2K)
-        S=2048:   2.31x speedup
-        S=4096:   4.76x speedup
-        S=8192:   8.96x speedup
-        S=65536:  20.6x speedup
-        S=262144: 44.1x speedup
-        S=524288: 58.4x speedup
+        S=512:    0.54x vs SDPA  (crossover ~2K)
+        S=2048:   1.80x speedup
+        S=4096:   4.63x speedup
+        S=8192:   9.03x speedup
+        S=65536:  30.4x speedup
+        S=262144: 60.4x speedup
+        S=524288: 81.0x speedup
 
     Forward pass — Large model (H=16, D=128):
         S=512:    0.84x vs SDPA  (crossover ~1K)
@@ -49,7 +49,7 @@ Key Results (RTX 5070 Ti, FP16, PyTorch 2.9.1 + CUDA 12.8):
         S=262144: 51.4x speedup
 
     Training (fwd+bwd):
-        S=4096:  1.45x, S=8192: 1.73x, S=131K: 3.76x
+        S=4096:  2.03x, S=8192: 3.32x, S=131K: 3.70x
         Crossover ~2K (fully-fused single-kernel backward for S≤8K)
 
     Hybrid mode: ≥1.0x at ALL lengths (auto SDPA below 1536)
