@@ -1235,31 +1235,32 @@ def _dkdv_strided_key_centric(
     stride_dvb, stride_dvh, stride_dvn, stride_dvd,
     stride_lb, stride_lh, stride_lm,
     S: tl.constexpr, D: tl.constexpr, SQRT_N: tl.constexpr,
-    BLOCK_Q: tl.constexpr, BLOCK_D: tl.constexpr,
+    BLOCK_Q: tl.constexpr, BLOCK_D: tl.constexpr, NUM_Q_TILES: tl.constexpr,
 ):
     """
-    Key-Centric Strided dK/dV: ZERO ATOMICS.
-    
-    Grid: (num_strided_keys, B, H)
-    
-    Each block OWNS one strided key at position k_pos = strided_idx * SQRT_N.
-    It iterates over ALL queries that attend to this key (from k_pos + SQRT_N to S).
-    Accumulates dK and dV in registers.
-    Writes ONCE to global memory at the end.
-    
-    Why this is fast:
-    - 256 strided keys at S=64K -> 2048 blocks with B=1, H=8
-    - Each block streams through queries (coalesced reads)
-    - ZERO atomic contention
-    - Register accumulation is fast
+    Key-Centric Strided dK/dV with 2D query tiling (ZERO ATOMICS per tile).
+
+    Grid: (num_strided_keys * NUM_Q_TILES, B, H)
+
+    Each block OWNS one (strided_key, query_tile) pair. The query axis is split
+    across NUM_Q_TILES instances so the O(N) inner loop is parallelised across
+    blocks.  atomic_add at the end merges partial dK/dV from the query tiles.
+
+    NUM_Q_TILES selection (Python side):
+      S <= 256  → NUM_Q_TILES = 1   (single block covers the whole query range)
+      S <= 512  → NUM_Q_TILES = 2
+      S > 512   → NUM_Q_TILES = 4
     """
-    strided_idx = tl.program_id(0)  # Which strided key (0 to num_strided_keys-1)
-    b = tl.program_id(1)            # Batch
-    h = tl.program_id(2)            # Head
-    
+    combined_idx = tl.program_id(0)  # encodes strided_idx * NUM_Q_TILES + q_tile_idx
+    b            = tl.program_id(1)
+    h            = tl.program_id(2)
+
+    strided_idx = combined_idx // NUM_Q_TILES
+    q_tile_idx  = combined_idx % NUM_Q_TILES
+
     # Position of this strided key
     k_pos = strided_idx * SQRT_N
-    
+
     if k_pos >= S:
         return
     
@@ -1280,19 +1281,25 @@ def _dkdv_strided_key_centric(
     
     scale = 1.0 / tl.sqrt(tl.cast(D, tl.float32))
     
-    # Iterate over ALL queries that attend to this strided key
-    # A query q attends to strided key k_pos if:
-    #   k_pos < local_start(q) where local_start(q) = max(q - SQRT_N + 1, 0)
-    # This means q >= k_pos + SQRT_N
+    # Queries that attend to this strided key: q >= k_pos + SQRT_N
     q_start = k_pos + SQRT_N
-    
+
     if q_start >= S:
         return  # No queries attend to this strided key
-    
-    # Stream through queries in blocks
-    for q_block_start in range(q_start, S, BLOCK_Q):
+
+    # 2D tiling: subdivide [q_start, S) across NUM_Q_TILES instances
+    total_q      = S - q_start
+    q_per_tile   = (total_q + NUM_Q_TILES - 1) // NUM_Q_TILES
+    tile_q_start = q_start + q_tile_idx * q_per_tile
+    tile_q_end   = tl.minimum(tile_q_start + q_per_tile, S)
+
+    if tile_q_start >= S:
+        return  # This tile is empty
+
+    # Stream through our query tile
+    for q_block_start in range(tile_q_start, tile_q_end, BLOCK_Q):
         q_offsets = q_block_start + tl.arange(0, BLOCK_Q)
-        q_mask = q_offsets < S
+        q_mask = q_offsets < tile_q_end
         
         # Load Q block: [BLOCK_Q, D]
         q_ptr = Q + b * stride_qb + h * stride_qh
@@ -1470,23 +1477,21 @@ def _dkdv_strided_key_centric_gqa(
     stride_lb, stride_lh, stride_lm,
     S: tl.constexpr, D: tl.constexpr, SQRT_N: tl.constexpr,
     BLOCK_Q: tl.constexpr, BLOCK_D: tl.constexpr,
-    KV_GROUPS: tl.constexpr,
+    KV_GROUPS: tl.constexpr, NUM_Q_TILES: tl.constexpr,
 ):
     """
-    GQA key-centric strided dK/dV.
+    GQA key-centric strided dK/dV with 2D query tiling.
 
-    Grid: (num_strided_keys, B, H_kv)
-    Each program owns one strided KV position and loops over ALL KV_GROUPS Q
-    heads that share this KV head.  Uses atomic_add to merge with the local
-    phase (which already performed a direct store for this position).
-
-    Since each (h_kv, k_pos) is owned by exactly one program per phase
-    (local=direct-store, strided=atomic_add), there is no cross-program
-    contention within GQA — eliminating the kv_groups×atomics issue.
+    Grid: (num_strided_keys * NUM_Q_TILES, B, H_kv)
+    Each program owns one (strided_key, q_tile) pair and loops over KV_GROUPS
+    Q heads. atomic_add merges partial dK/dV from query tiles with the local phase.
     """
-    strided_idx = tl.program_id(0)
-    b           = tl.program_id(1)
-    h_kv        = tl.program_id(2)
+    combined_idx = tl.program_id(0)
+    b            = tl.program_id(1)
+    h_kv         = tl.program_id(2)
+
+    strided_idx = combined_idx // NUM_Q_TILES
+    q_tile_idx  = combined_idx % NUM_Q_TILES
 
     k_pos = strided_idx * SQRT_N
     if k_pos >= S:
@@ -1511,13 +1516,22 @@ def _dkdv_strided_key_centric_gqa(
     if q_start >= S:
         return
 
+    # 2D tiling: subdivide [q_start, S) across NUM_Q_TILES instances
+    total_q      = S - q_start
+    q_per_tile   = (total_q + NUM_Q_TILES - 1) // NUM_Q_TILES
+    tile_q_start = q_start + q_tile_idx * q_per_tile
+    tile_q_end   = tl.minimum(tile_q_start + q_per_tile, S)
+
+    if tile_q_start >= S:
+        return  # This tile is empty
+
     # Accumulate from all KV_GROUPS Q heads sharing this KV head
     for g in range(KV_GROUPS):
         h_q = h_kv * KV_GROUPS + g
 
-        for q_block_start in range(q_start, S, BLOCK_Q):
+        for q_block_start in range(tile_q_start, tile_q_end, BLOCK_Q):
             q_offsets  = q_block_start + tl.arange(0, BLOCK_Q)
-            q_mask     = q_offsets < S
+            q_mask     = q_offsets < tile_q_end
 
             q_ptr  = Q + b * stride_qb + h_q * stride_qh
             q      = tl.load(q_ptr + q_offsets[:, None] * stride_qm + d_idx[None, :] * stride_qd,
@@ -1948,6 +1962,119 @@ def _dkdv_relay_v14(
 
 
 # =============================================================================
+# RELAY PRECOMPUTE KERNEL  (fused pad + reshape + mean, active at S > 8192)
+# =============================================================================
+
+@triton.jit
+def _relay_precompute_fwd(
+    K, V, relay_k, relay_v,
+    stride_kb, stride_kh, stride_ks, stride_kd,
+    stride_vb, stride_vh, stride_vs, stride_vd,
+    stride_rkb, stride_rkh, stride_rkr, stride_rkd,
+    stride_rvb, stride_rvh, stride_rvr, stride_rvd,
+    H_kv,
+    S: tl.constexpr, D: tl.constexpr,
+    SQRT_N: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    """
+    Fused relay precompute: replaces pad + reshape + mean(dim=3) with a
+    single Triton kernel.
+
+    Grid: (B * H_kv, NUM_RELAY)
+    Each program averages one SQRT_N-element block of K and V into one slot
+    of relay_k / relay_v.  The last relay slot handles S % SQRT_N != 0 via
+    masked loads — no explicit padding buffer needed.
+    """
+    bh = tl.program_id(0)   # linearized (batch * H_kv)
+    r  = tl.program_id(1)   # relay slot index
+
+    b  = bh // H_kv
+    h  = bh %  H_kv
+
+    # Sequence range for this relay slot
+    s_start = r * SQRT_N
+
+    d_idx  = tl.arange(0, BLOCK_D)
+    d_mask = d_idx < D
+
+    k_sum = tl.zeros([BLOCK_D], dtype=tl.float32)
+    v_sum = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+    k_base = K + b * stride_kb + h * stride_kh
+    v_base = V + b * stride_vb + h * stride_vh
+
+    for i in range(SQRT_N):
+        s_i   = s_start + i
+        smask = d_mask & (s_i < S)
+        k_row = tl.load(k_base + s_i * stride_ks + d_idx * stride_kd,
+                        mask=smask, other=0.0)
+        v_row = tl.load(v_base + s_i * stride_vs + d_idx * stride_vd,
+                        mask=smask, other=0.0)
+        k_sum += k_row.to(tl.float32)
+        v_sum += v_row.to(tl.float32)
+
+    # Number of valid elements (< SQRT_N only for the last relay slot)
+    valid = tl.minimum(SQRT_N, S - s_start)
+    inv_v = 1.0 / valid.to(tl.float32)
+
+    rk_ptr = relay_k + b * stride_rkb + h * stride_rkh + r * stride_rkr
+    rv_ptr = relay_v + b * stride_rvb + h * stride_rvh + r * stride_rvr
+    tl.store(rk_ptr + d_idx * stride_rkd,
+             (k_sum * inv_v).to(relay_k.dtype.element_ty), mask=d_mask)
+    tl.store(rv_ptr + d_idx * stride_rvd,
+             (v_sum * inv_v).to(relay_v.dtype.element_ty), mask=d_mask)
+
+
+# =============================================================================
+# RELAY SCATTER BACKWARD KERNEL  (replaces expand + reshape + +=, S > 8192)
+# =============================================================================
+
+@triton.jit
+def _relay_scatter_bwd(
+    d_relay, d_kv,
+    stride_drb, stride_drh, stride_drr, stride_drd,
+    stride_dkvb, stride_dkvh, stride_dkvs, stride_dkvd,
+    H_kv,
+    S: tl.constexpr, D: tl.constexpr,
+    SQRT_N: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    """
+    Relay scatter backward: distributes d_relay[b,h,r,:] / SQRT_N to
+    d_kv[b,h,s,:]  for each s in [r*SQRT_N, (r+1)*SQRT_N) ∩ [0, S).
+
+    Grid: (B * H_kv, NUM_RELAY)
+    Each program scatters exactly one relay gradient into up to SQRT_N positions.
+    Relay slots are disjoint in the sequence dimension, so a plain load+store
+    replaces atomic_add (no intra-kernel or inter-kernel write hazards after the
+    local + strided phases have already run).
+    """
+    bh = tl.program_id(0)
+    r  = tl.program_id(1)
+
+    b  = bh // H_kv
+    h  = bh %  H_kv
+
+    s_start = r * SQRT_N
+
+    d_idx  = tl.arange(0, BLOCK_D)
+    d_mask = d_idx < D
+
+    # Load relay gradient and scale by 1/SQRT_N
+    dr_ptr    = d_relay + b * stride_drb + h * stride_drh + r * stride_drr
+    dr        = tl.load(dr_ptr + d_idx * stride_drd, mask=d_mask, other=0.0).to(tl.float32)
+    dr_scaled = dr * (1.0 / SQRT_N)
+
+    dkv_base = d_kv + b * stride_dkvb + h * stride_dkvh
+
+    for i in range(SQRT_N):
+        s_i   = s_start + i
+        smask = d_mask & (s_i < S)
+        ptr   = dkv_base + s_i * stride_dkvs + d_idx * stride_dkvd
+        cur   = tl.load(ptr, mask=smask, other=0.0).to(tl.float32)
+        tl.store(ptr, (cur + dr_scaled).to(d_kv.dtype.element_ty), mask=smask)
+
+
+# =============================================================================
 # PYTHON WRAPPER CLASS
 # =============================================================================
 
@@ -1983,6 +2110,8 @@ class CronRootAttentionV14Function(torch.autograd.Function):
         num_tiles_n     = (S + BLOCK_N - 1) // BLOCK_N
         num_strided     = (S + SQRT_N - 1) // SQRT_N
         BLOCK_Q_STRIDED = 64
+        # Select NUM_Q_TILES: parallelize the O(N) query loop across tiles
+        NUM_Q_TILES_STRIDED = 1 if S <= 256 else (2 if S <= 512 else 4)
 
         _cron_root_attn_bwd_dq_only_v14[(B, H_q, num_tiles_m)](
             q, k, v, o, do, dq, L,
@@ -2017,7 +2146,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             num_warps=4, num_stages=1,
         )
         if num_strided > 0:
-            _dkdv_strided_key_centric[(num_strided, B, H_q)](
+            _dkdv_strided_key_centric[(num_strided * NUM_Q_TILES_STRIDED, B, H_q)](
                 q, k, v, o, do, dk, dv, L,
                 q.stride(0), q.stride(1), q.stride(2), q.stride(3),
                 k.stride(0), k.stride(1), k.stride(2), k.stride(3),
@@ -2029,6 +2158,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                 L.stride(0), L.stride(1), L.stride(2),
                 S=S, D=D, SQRT_N=SQRT_N,
                 BLOCK_Q=BLOCK_Q_STRIDED, BLOCK_D=BLOCK_D,
+                NUM_Q_TILES=NUM_Q_TILES_STRIDED,
                 num_warps=4, num_stages=1,
             )
 
@@ -2125,6 +2255,8 @@ class CronRootAttentionV14Function(torch.autograd.Function):
         num_kv_tiles     = (S + BLOCK_N - 1) // BLOCK_N
         num_strided      = (S + SQRT_N - 1) // SQRT_N
         BLOCK_Q_STRIDED  = 64
+        # Select NUM_Q_TILES: parallelize the O(N) query loop across tiles
+        NUM_Q_TILES_STRIDED = 1 if S <= 256 else (2 if S <= 512 else 4)
 
         # dQ kernel: Q-head-centric, reads K/V at (h_q // KV_GROUPS)
         _cron_root_attn_bwd_dq_only_v14[(B, H_q, num_tiles_m)](
@@ -2164,7 +2296,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
         )
         # dK/dV strided phase: KV-head-centric, atomic_add merges with local
         if num_strided > 0:
-            _dkdv_strided_key_centric_gqa[(num_strided, B, H_kv)](
+            _dkdv_strided_key_centric_gqa[(num_strided * NUM_Q_TILES_STRIDED, B, H_kv)](
                 q, k, v, o, do, dk, dv, L,
                 q.stride(0), q.stride(1), q.stride(2), q.stride(3),
                 k.stride(0), k.stride(1), k.stride(2), k.stride(3),
@@ -2176,7 +2308,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                 L.stride(0), L.stride(1), L.stride(2),
                 S=S, D=D, SQRT_N=SQRT_N,
                 BLOCK_Q=BLOCK_Q_STRIDED, BLOCK_D=BLOCK_D,
-                KV_GROUPS=KV_GROUPS,
+                KV_GROUPS=KV_GROUPS, NUM_Q_TILES=NUM_Q_TILES_STRIDED,
                 num_warps=4, num_stages=1,
             )
 
@@ -2282,17 +2414,21 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             relay_k = torch.empty(B, H_kv, 1, D, device=q.device, dtype=q.dtype)
             relay_v = torch.empty(B, H_kv, 1, D, device=q.device, dtype=q.dtype)
         else:
-            # Full relay pre-computation
+            # Full relay pre-computation via fused Triton kernel
+            # Replaces: pad + reshape + mean (2-3 CUDA launches) → single kernel
             NUM_RELAY = (S + SQRT_N - 1) // SQRT_N
-            pad_len = NUM_RELAY * SQRT_N - S
-            if pad_len > 0:
-                k_padded = torch.nn.functional.pad(k, (0, 0, 0, pad_len))
-                v_padded = torch.nn.functional.pad(v, (0, 0, 0, pad_len))
-            else:
-                k_padded = k
-                v_padded = v
-            relay_k = k_padded.reshape(B, H_kv, NUM_RELAY, SQRT_N, D).mean(dim=3).contiguous()
-            relay_v = v_padded.reshape(B, H_kv, NUM_RELAY, SQRT_N, D).mean(dim=3).contiguous()
+            relay_k = torch.empty(B, H_kv, NUM_RELAY, D, device=k.device, dtype=k.dtype)
+            relay_v = torch.empty(B, H_kv, NUM_RELAY, D, device=k.device, dtype=k.dtype)
+            _BLOCK_D_RELAY = triton.next_power_of_2(D)
+            _relay_precompute_fwd[(B * H_kv, NUM_RELAY)](
+                k, v, relay_k, relay_v,
+                k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+                v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+                relay_k.stride(0), relay_k.stride(1), relay_k.stride(2), relay_k.stride(3),
+                relay_v.stride(0), relay_v.stride(1), relay_v.stride(2), relay_v.stride(3),
+                H_kv=H_kv,
+                S=S, D=D, SQRT_N=SQRT_N, BLOCK_D=_BLOCK_D_RELAY,
+            )
         
         # Allocate outputs
         o = torch.empty_like(q)
@@ -2493,12 +2629,13 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                 BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, BLOCK_Q=BLOCK_Q,
             )
             
-            # KEY-CENTRIC STRIDED dK/dV
-            num_strided_keys = (S + SQRT_N - 1) // SQRT_N
-            BLOCK_Q_STRIDED = 64
+            # KEY-CENTRIC STRIDED dK/dV  (2D tiling: split query axis across tiles)
+            num_strided_keys    = (S + SQRT_N - 1) // SQRT_N
+            BLOCK_Q_STRIDED     = 64
+            NUM_Q_TILES_STRIDED = 1 if S <= 256 else (2 if S <= 512 else 4)
             
             if num_strided_keys > 0:
-                _dkdv_strided_key_centric[(num_strided_keys, B, H_q)](
+                _dkdv_strided_key_centric[(num_strided_keys * NUM_Q_TILES_STRIDED, B, H_q)](
                     q, k, v, o, do, dk, dv, L,
                     q.stride(0), q.stride(1), q.stride(2), q.stride(3),
                     k.stride(0), k.stride(1), k.stride(2), k.stride(3),
@@ -2510,6 +2647,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                     L.stride(0), L.stride(1), L.stride(2),
                     S=S, D=D, SQRT_N=SQRT_N,
                     BLOCK_Q=BLOCK_Q_STRIDED, BLOCK_D=BLOCK_D,
+                    NUM_Q_TILES=NUM_Q_TILES_STRIDED,
                 )
             
             # RELAY dK/dV (only when relay was used)
@@ -2533,14 +2671,24 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                     BLOCK_Q=BLOCK_Q_RELAY, BLOCK_D=BLOCK_D,
                 )
                 
-                # SCATTER RELAY GRADIENTS BACK TO dK, dV
-                d_relay_k_expanded = (d_relay_k / SQRT_N).unsqueeze(3).expand(B, H_kv, NUM_RELAY, SQRT_N, D)
-                d_relay_k_expanded = d_relay_k_expanded.reshape(B, H_kv, NUM_RELAY * SQRT_N, D)
-                dk[:, :, :S, :] += d_relay_k_expanded[:, :, :S, :]
-                
-                d_relay_v_expanded = (d_relay_v / SQRT_N).unsqueeze(3).expand(B, H_kv, NUM_RELAY, SQRT_N, D)
-                d_relay_v_expanded = d_relay_v_expanded.reshape(B, H_kv, NUM_RELAY * SQRT_N, D)
-                dv[:, :, :S, :] += d_relay_v_expanded[:, :, :S, :]
+                # SCATTER RELAY GRADIENTS BACK TO dK, dV via fused Triton kernel
+                # Replaces: (d_relay / SQRT_N).unsqueeze(3).expand(...).reshape(...)
+                # No atomic contention: relay slots are disjoint in sequence dim.
+                _BLOCK_D_RELAY = triton.next_power_of_2(D)
+                _relay_scatter_bwd[(B * H_kv, NUM_RELAY)](
+                    d_relay_k, dk,
+                    d_relay_k.stride(0), d_relay_k.stride(1), d_relay_k.stride(2), d_relay_k.stride(3),
+                    dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
+                    H_kv=H_kv,
+                    S=S, D=D, SQRT_N=SQRT_N, BLOCK_D=_BLOCK_D_RELAY,
+                )
+                _relay_scatter_bwd[(B * H_kv, NUM_RELAY)](
+                    d_relay_v, dv,
+                    d_relay_v.stride(0), d_relay_v.stride(1), d_relay_v.stride(2), d_relay_v.stride(3),
+                    dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
+                    H_kv=H_kv,
+                    S=S, D=D, SQRT_N=SQRT_N, BLOCK_D=_BLOCK_D_RELAY,
+                )
         
         # ── Diagnostic: surface any backward Triton/graph errors here ─────
         torch.cuda.synchronize(dq.device)
