@@ -179,6 +179,45 @@ def _get_num_sms():
     return NUM_SMS
 
 # =============================================================================
+# BLACKWELL (SM 12.0) KERNEL CONFIGURATION
+# =============================================================================
+# Triton kernel launch parameters tuned per GPU generation.
+#
+#  num_warps:
+#    Blackwell SM 12.0 has a larger register file (256KB vs 128KB on Ampere)
+#    and 128-wide warp schedulers, so doubling warps per block from 4→8 gives
+#    better latency hiding for memory-bound attention kernels.
+#    Hopper SM 9.0 also benefits from 8 warps due to its wider execution units.
+#
+#  num_stages (forward):
+#    Controls the software-pipelining depth for async LDGSTS prefetch.
+#    Blackwell's deeper L2 cache hierarchy and larger shared memory allow
+#    num_stages=4 (vs 2 on Ampere) without spilling — effectively overlapping
+#    2 extra tiles of data loading with compute.
+#
+#  num_stages (backward):
+#    Backward kernels carry more live accumulators (dQ,dK,dV in FP32), so
+#    we cap at 2 to avoid register pressure spills even on Blackwell.
+# =============================================================================
+
+def _get_blackwell_kernel_config():
+    """Return (num_warps, num_stages_fwd, num_stages_bwd) for the current GPU."""
+    if not torch.cuda.is_available():
+        return 4, 2, 1
+    sm_major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
+    if sm_major >= 12:   # Blackwell (SM 12.0: RTX 50xx, B100/B200)
+        return 8, 4, 2
+    if sm_major >= 9:    # Hopper (SM 9.0: H100/H200)
+        return 8, 3, 2
+    if sm_major >= 8:    # Ampere / Ada (SM 8.x: RTX 30/40xx, A100)
+        return 4, 2, 1
+    return 4, 1, 1       # Turing and earlier
+
+_KNL_WARPS, _KNL_STAGES_FWD, _KNL_STAGES_BWD = _get_blackwell_kernel_config()
+# Short aliases used at kernel launch sites
+_KW, _KS, _KS_FWD = _KNL_WARPS, _KNL_STAGES_BWD, _KNL_STAGES_FWD
+
+# =============================================================================
 # V14 PERSISTENT TILED FORWARD KERNEL
 # =============================================================================
 
@@ -2300,7 +2339,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             NUM_RELAY=0, BLOCK_RELAY=BLOCK_RELAY,
             BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
             BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
-            num_warps=4, num_stages=1,
+            num_warps=_KW, num_stages=_KS,
         )
         _dkdv_local_phase[(B, H_q, num_tiles_n)](
             q, k, v, o, do, dk, dv, L,
@@ -2314,7 +2353,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             L.stride(0), L.stride(1), L.stride(2),
             S=S, D=D, SQRT_N=SQRT_N,
             BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, BLOCK_Q=BLOCK_Q,
-            num_warps=4, num_stages=1,
+            num_warps=_KW, num_stages=_KS,
         )
         if num_strided > 0:
             _dkdv_strided_key_centric[(num_strided * NUM_Q_TILES_STRIDED, B, H_q)](
@@ -2330,7 +2369,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                 S=S, D=D, SQRT_N=SQRT_N,
                 BLOCK_Q=BLOCK_Q_STRIDED, BLOCK_D=BLOCK_D,
                 NUM_Q_TILES=NUM_Q_TILES_STRIDED,
-                num_warps=4, num_stages=1,
+                num_warps=_KW, num_stages=_KS,
             )
 
     @staticmethod
@@ -2447,7 +2486,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
             BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
             KV_GROUPS=KV_GROUPS,
-            num_warps=4, num_stages=1,
+            num_warps=_KW, num_stages=_KS,
         )
         # dK/dV local phase: KV-head-centric, direct store (no atomics)
         _dkdv_local_phase_gqa[(B, H_kv, num_kv_tiles)](
@@ -2463,7 +2502,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             S=S, D=D, SQRT_N=SQRT_N,
             BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, BLOCK_Q=BLOCK_Q,
             KV_GROUPS=KV_GROUPS,
-            num_warps=4, num_stages=1,
+            num_warps=_KW, num_stages=_KS,
         )
         # dK/dV strided phase: KV-head-centric, atomic_add merges with local
         if num_strided > 0:
@@ -2480,7 +2519,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                 S=S, D=D, SQRT_N=SQRT_N,
                 BLOCK_Q=BLOCK_Q_STRIDED, BLOCK_D=BLOCK_D,
                 KV_GROUPS=KV_GROUPS, NUM_Q_TILES=NUM_Q_TILES_STRIDED,
-                num_warps=4, num_stages=1,
+                num_warps=_KW, num_stages=_KS,
             )
 
     @staticmethod
@@ -2660,7 +2699,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                 BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
                 BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
                 KV_GROUPS=kv_groups,
-                num_warps=4, num_stages=2,
+                num_warps=_KW, num_stages=_KS_FWD,
             )
         
         ctx.save_for_backward(q, k, v, o, L, relay_k, relay_v, relay_w)
@@ -2808,6 +2847,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                 BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
                 BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
                 KV_GROUPS=ctx.kv_groups,
+                num_warps=_KW, num_stages=_KS,
             )
 
             # dK/dV: branch on kv_groups for correct head indexing
@@ -2836,6 +2876,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                     S=S, D=D, SQRT_N=SQRT_N,
                     BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, BLOCK_Q=BLOCK_Q,
                     KV_GROUPS=ctx.kv_groups,
+                    num_warps=_KW, num_stages=_KS,
                 )
                 # STRIDED dK/dV
                 if num_strided_keys > 0:
@@ -2852,6 +2893,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                         S=S, D=D, SQRT_N=SQRT_N,
                         BLOCK_Q=BLOCK_Q_STRIDED, BLOCK_D=BLOCK_D,
                         KV_GROUPS=ctx.kv_groups, NUM_Q_TILES=NUM_Q_TILES_STRIDED,
+                        num_warps=_KW, num_stages=_KS,
                     )
                 # RELAY dK/dV (GQA-aware: grid over H_kv, loops KV_GROUPS inside)
                 if NUM_RELAY > 0 and not skip_relay:
@@ -2918,6 +2960,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                     L.stride(0), L.stride(1), L.stride(2),
                     S=S, D=D, SQRT_N=SQRT_N,
                     BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, BLOCK_Q=BLOCK_Q,
+                    num_warps=_KW, num_stages=_KS,
                 )
                 # KEY-CENTRIC STRIDED dK/dV
                 if num_strided_keys > 0:
@@ -2934,6 +2977,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                         S=S, D=D, SQRT_N=SQRT_N,
                         BLOCK_Q=BLOCK_Q_STRIDED, BLOCK_D=BLOCK_D,
                         NUM_Q_TILES=NUM_Q_TILES_STRIDED,
+                        num_warps=_KW, num_stages=_KS,
                     )
                 # RELAY dK/dV (MHA: grid over H_q)
                 if NUM_RELAY > 0 and not skip_relay:
