@@ -218,6 +218,115 @@ _KNL_WARPS, _KNL_STAGES_FWD, _KNL_STAGES_BWD = _get_blackwell_kernel_config()
 _KW, _KS, _KS_FWD = _KNL_WARPS, _KNL_STAGES_BWD, _KNL_STAGES_FWD
 
 # =============================================================================
+# BLACKWELL-OPTIMISED TRITON GEMM
+# =============================================================================
+# Tuned for SM 12.0 (RTX 50xx / B-series):
+#   128×128 tiles → fits Blackwell's 4× larger L1 (192 KB/SM, up from 48 KB)
+#   BLOCK_K=64, num_warps=8, num_stages=4 → hides 4-cycle MMA latency
+# Falls back gracefully on Ampere (still correct, slightly sub-optimal vs cuBLAS).
+
+@triton.jit
+def _blackwell_gemm_kernel(
+    A, B, C,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """General matmul C = A @ B.  A:[M,K], B:[K,N], C:[M,N]."""
+    pid        = tl.program_id(0)
+    num_pid_m  = tl.cdiv(M, BLOCK_M)
+    num_pid_n  = tl.cdiv(N, BLOCK_N)
+    num_in_grp = GROUP_SIZE_M * num_pid_n
+    group_id   = pid // num_in_grp
+    first_m    = group_id * GROUP_SIZE_M
+    grp_size   = min(num_pid_m - first_m, GROUP_SIZE_M)
+    pid_m      = first_m + (pid % num_in_grp) % grp_size
+    pid_n      = (pid % num_in_grp) // grp_size
+
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = A + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = B + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        mask_k = offs_k < K - k * BLOCK_K
+        a = tl.load(a_ptrs, mask=mask_k[None, :], other=0.0)
+        b = tl.load(b_ptrs, mask=mask_k[:, None], other=0.0)
+        acc = tl.dot(a, b, acc)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Write output (cast back to input dtype)
+    c = acc.to(A.dtype.element_ty)
+    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    c_ptrs  = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask  = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
+# Block/warp/stage config for the GEMM kernel (different from attention tiles)
+# Blackwell: 128×128 blocks use 192 KB L1 efficiently; 4 stages hide MMA latency.
+# Ampere : 64×64 blocks with 2 stages are safe within 48 KB L1.
+_GEMM_BLOCK_M, _GEMM_BLOCK_N, _GEMM_BLOCK_K = (
+    (128, 128, 64) if _KNL_WARPS >= 8 else (64, 64, 32)
+)
+_GEMM_GROUP_SIZE_M = 8
+
+
+def blackwell_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """
+    Drop-in for ``torch.matmul(a, b)`` (no bias).  a:[M,K], b:[K,N] → [M,N].
+    BF16/FP16 only.  Falls back to torch.matmul for unsupported dtypes.
+    Only used for shapes where the Triton path is profitable (M,N,K all ≥ 64).
+    """
+    if a.dtype not in (torch.float16, torch.bfloat16):
+        return torch.matmul(a, b)
+    assert a.is_cuda and b.is_cuda, "blackwell_matmul: inputs must be on CUDA"
+    M, K  = a.shape
+    K2, N = b.shape
+    assert K == K2, f"shape mismatch: a={a.shape}, b={b.shape}"
+    if M < _GEMM_BLOCK_M or N < _GEMM_BLOCK_N or K < _GEMM_BLOCK_K:
+        return torch.matmul(a, b)  # too small — cuBLAS wins
+    c    = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    grid = (triton.cdiv(M, _GEMM_BLOCK_M) * triton.cdiv(N, _GEMM_BLOCK_N),)
+    _blackwell_gemm_kernel[grid](
+        a, b, c,
+        M, N, K,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+        BLOCK_M=_GEMM_BLOCK_M, BLOCK_N=_GEMM_BLOCK_N, BLOCK_K=_GEMM_BLOCK_K,
+        GROUP_SIZE_M=_GEMM_GROUP_SIZE_M,
+        num_warps=_KNL_WARPS,
+        num_stages=_KNL_STAGES_FWD,
+    )
+    return c
+
+
+def blackwell_linear(x: torch.Tensor, weight: torch.Tensor,
+                     bias: torch.Tensor | None = None) -> torch.Tensor:
+    """
+    Drop-in for ``F.linear(x, weight, bias)``.
+    Reshapes leading batch dims to 2-D, calls blackwell_matmul, then restores.
+    """
+    orig_shape = x.shape
+    x2d = x.reshape(-1, orig_shape[-1])              # [B*T, D]
+    out = blackwell_matmul(x2d, weight.t())          # [B*T, D_out]
+    if bias is not None:
+        out = out + bias
+    return out.reshape(*orig_shape[:-1], out.shape[-1])
+
+
+# =============================================================================
 # V14 PERSISTENT TILED FORWARD KERNEL
 # =============================================================================
 
