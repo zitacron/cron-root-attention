@@ -2827,14 +2827,6 @@ class CronRootAttentionV14Function(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do: torch.Tensor):
         q, k, v, o, L, relay_k, relay_v, relay_w = ctx.saved_tensors
-        # ── Diagnostic: surface async Triton forward errors at a Python frame ─
-        # This synchronize() converts any deferred cudaErrorIllegalAddress from
-        # the forward Triton kernels into a synchronous Python RuntimeError with
-        # a proper traceback (instead of in TensorImpl::~TensorImpl).
-        # NOTE: synchronize(device) does NOT change current_device — safe for FP8.
-        # Remove once the crash root cause is identified.
-        torch.cuda.synchronize(q.device)
-        # ─────────────────────────────────────────────────────────────────────
         # NOTE: do NOT call torch.cuda.set_device(q.device) here.  It is a
         # non-context-manager call that permanently changes the global current
         # device, poisoning downstream TE/FP8 CUBLAS workspace references and
