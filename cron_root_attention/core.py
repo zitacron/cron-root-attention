@@ -2692,6 +2692,197 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             g.replay()
             return s_dq.clone(), s_dk.clone(), s_dv.clone()
 
+    # ── RELAY-4 CUDA-graph cache (MHA, relay-active path) ─────────────────
+    # Key: (B, H_q, S, D, NUM_RELAY, BLOCK_M, BLOCK_D, BLOCK_STRIDE,
+    #        BLOCK_LOCAL, BLOCK_RELAY, device_idx)
+    # Value: (graph, s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv, s_relay_w,
+    #         s_d_rk, s_d_rv, s_dq, s_dk, s_dv)
+    #
+    # Collapses 6 Triton dispatches (dQ-only + local-dK/dV + strided-dK/dV +
+    # relay-dK/dV + 2×relay_scatter_bwd) from ~6×50μs = 300μs Python overhead
+    # to a single graph.replay() (~5μs). Active for S > RELAY_THRESHOLD (256)
+    # i.e. the entire S=512 training stage.
+    _relay4_graph_cache: dict = {}
+
+    @staticmethod
+    def _relay4_launch(q, k, v, o, do, L, relay_k, relay_v, relay_w,
+                       dq, dk, dv, d_relay_k, d_relay_v,
+                       S, D, SQRT_N, NUM_RELAY,
+                       BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE, BLOCK_RELAY,
+                       B, H_q):
+        """Raw 6-kernel relay4 MHA backward (for warmup).  Never called on the hot path."""
+        BLOCK_N, BLOCK_Q   = 32, 32
+        num_tiles_m        = (S + BLOCK_M - 1) // BLOCK_M
+        num_tiles_n        = (S + BLOCK_N - 1) // BLOCK_N
+        num_strided_keys   = (S + SQRT_N - 1) // SQRT_N
+        BLOCK_Q_STRIDED    = 64
+        NUM_Q_TILES_STRIDED = 1 if S <= 256 else (2 if S <= 512 else 4)
+        BLOCK_Q_RELAY      = 64
+        _BLOCK_D_RELAY     = triton.next_power_of_2(D)
+
+        # dQ-only (includes relay contribution to dQ)
+        _cron_root_attn_bwd_dq_only_v14[(B, H_q, num_tiles_m)](
+            q, k, v, o, do, dq, L,
+            relay_k, relay_v,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+            do.stride(0), do.stride(1), do.stride(2), do.stride(3),
+            dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
+            L.stride(0), L.stride(1), L.stride(2),
+            relay_k.stride(0), relay_k.stride(1), relay_k.stride(2), relay_k.stride(3),
+            relay_v.stride(0), relay_v.stride(1), relay_v.stride(2), relay_v.stride(3),
+            S=S, D=D, SQRT_N=SQRT_N,
+            NUM_RELAY=NUM_RELAY, BLOCK_RELAY=BLOCK_RELAY,
+            BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
+            BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
+            KV_GROUPS=1,
+            num_warps=_KW, num_stages=_KS,
+        )
+        # local dK/dV
+        _dkdv_local_phase[(B, H_q, num_tiles_n)](
+            q, k, v, o, do, dk, dv, L,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+            do.stride(0), do.stride(1), do.stride(2), do.stride(3),
+            dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
+            dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
+            L.stride(0), L.stride(1), L.stride(2),
+            S=S, D=D, SQRT_N=SQRT_N,
+            BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, BLOCK_Q=BLOCK_Q,
+            num_warps=_KW, num_stages=_KS,
+        )
+        # strided dK/dV
+        if num_strided_keys > 0:
+            _dkdv_strided_key_centric[(num_strided_keys * NUM_Q_TILES_STRIDED, B, H_q)](
+                q, k, v, o, do, dk, dv, L,
+                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+                k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+                v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+                o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+                do.stride(0), do.stride(1), do.stride(2), do.stride(3),
+                dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
+                dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
+                L.stride(0), L.stride(1), L.stride(2),
+                S=S, D=D, SQRT_N=SQRT_N,
+                BLOCK_Q=BLOCK_Q_STRIDED, BLOCK_D=BLOCK_D,
+                NUM_Q_TILES=NUM_Q_TILES_STRIDED,
+                num_warps=_KW, num_stages=_KS,
+            )
+        # relay dK/dV (MHA: H_q heads)
+        _dkdv_relay_v14[(NUM_RELAY, B, H_q)](
+            q, relay_k, relay_v, o, do, d_relay_k, d_relay_v, L,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            relay_k.stride(0), relay_k.stride(1), relay_k.stride(2), relay_k.stride(3),
+            relay_v.stride(0), relay_v.stride(1), relay_v.stride(2), relay_v.stride(3),
+            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+            do.stride(0), do.stride(1), do.stride(2), do.stride(3),
+            d_relay_k.stride(0), d_relay_k.stride(1), d_relay_k.stride(2), d_relay_k.stride(3),
+            d_relay_v.stride(0), d_relay_v.stride(1), d_relay_v.stride(2), d_relay_v.stride(3),
+            L.stride(0), L.stride(1), L.stride(2),
+            S=S, D=D, SQRT_N=SQRT_N,
+            NUM_RELAY=NUM_RELAY,
+            BLOCK_Q=BLOCK_Q_RELAY, BLOCK_D=BLOCK_D,
+        )
+        # relay scatter: d_relay_k/v → dK, dV
+        _relay_scatter_bwd[(B * H_q, NUM_RELAY)](
+            d_relay_k, dk, relay_w,
+            d_relay_k.stride(0), d_relay_k.stride(1), d_relay_k.stride(2), d_relay_k.stride(3),
+            dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
+            relay_w.stride(0), relay_w.stride(1), relay_w.stride(2), relay_w.stride(3),
+            H_kv=H_q,
+            S=S, D=D, SQRT_N=SQRT_N, BLOCK_D=_BLOCK_D_RELAY,
+        )
+        _relay_scatter_bwd[(B * H_q, NUM_RELAY)](
+            d_relay_v, dv, relay_w,
+            d_relay_v.stride(0), d_relay_v.stride(1), d_relay_v.stride(2), d_relay_v.stride(3),
+            dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
+            relay_w.stride(0), relay_w.stride(1), relay_w.stride(2), relay_w.stride(3),
+            H_kv=H_q,
+            S=S, D=D, SQRT_N=SQRT_N, BLOCK_D=_BLOCK_D_RELAY,
+        )
+
+    @staticmethod
+    def _relay4_graphed(q, k, v, o, do, L, relay_k, relay_v, relay_w,
+                        S, D, SQRT_N, NUM_RELAY,
+                        BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE, BLOCK_RELAY,
+                        B, H_q):
+        """Relay-4 MHA backward with CUDA graph replay after first-call JIT warmup.
+
+        Same lifecycle as _split3_graphed: one warmup + capture per unique shape,
+        thereafter a single graph.replay() (~5μs CPU) replaces 6 raw Triton dispatches
+        (~300μs raw kernel launch overhead at S=512, 11 CRA layers).
+
+        d_relay_log_scale (a tiny [H_q] sum) is computed in Python AFTER graph replay
+        so it does not need to be inside the captured graph.
+        """
+        cache = CronRootAttentionV14Function._relay4_graph_cache
+        cache_key = (B, H_q, S, D, NUM_RELAY,
+                     BLOCK_M, BLOCK_D, BLOCK_STRIDE, BLOCK_LOCAL, BLOCK_RELAY,
+                     q.device.index)
+
+        if cache_key not in cache:
+            _wup_stream = torch.cuda.default_stream(q.device)
+            _cap_stream = torch.cuda.Stream(device=q.device)
+
+            with torch.cuda.stream(_wup_stream):
+                s_q       = q.clone();        s_k       = k.clone()
+                s_v       = v.clone();        s_o       = o.clone()
+                s_do      = do.clone();       s_L       = L.clone()
+                s_rk      = relay_k.clone();  s_rv      = relay_v.clone()
+                s_rw      = relay_w.clone()
+                s_dq      = torch.empty_like(q)
+                s_dk      = torch.zeros_like(k)  # zeros: atomic accumulation in kernels
+                s_dv      = torch.zeros_like(v)
+                s_d_rk    = torch.zeros_like(relay_k)
+                s_d_rv    = torch.zeros_like(relay_v)
+
+                _wup_stream.synchronize()
+                CronRootAttentionV14Function._relay4_launch(
+                    s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv, s_rw,
+                    s_dq, s_dk, s_dv, s_d_rk, s_d_rv,
+                    S, D, SQRT_N, NUM_RELAY,
+                    BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE, BLOCK_RELAY, B, H_q)
+                _wup_stream.synchronize()
+
+            with torch.cuda.stream(_cap_stream):
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, stream=_cap_stream):
+                    # dk/dv must be zeroed for atomic accumulation INSIDE the graph
+                    s_dk.zero_()
+                    s_dv.zero_()
+                    s_d_rk.zero_()
+                    s_d_rv.zero_()
+                    CronRootAttentionV14Function._relay4_launch(
+                        s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv, s_rw,
+                        s_dq, s_dk, s_dv, s_d_rk, s_d_rv,
+                        S, D, SQRT_N, NUM_RELAY,
+                        BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE, BLOCK_RELAY, B, H_q)
+            _cap_stream.synchronize()
+
+            cache[cache_key] = (g, s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv, s_rw,
+                                s_d_rk, s_d_rv, s_dq, s_dk, s_dv)
+
+        (g, s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv, s_rw,
+         s_d_rk, s_d_rv, s_dq, s_dk, s_dv) = cache[cache_key]
+
+        with torch.cuda.stream(torch.cuda.default_stream(q.device)):
+            s_q.copy_(q);   s_k.copy_(k);   s_v.copy_(v)
+            s_o.copy_(o);   s_do.copy_(do); s_L.copy_(L)
+            s_rk.copy_(relay_k); s_rv.copy_(relay_v); s_rw.copy_(relay_w)
+            g.replay()
+            # d_relay_log_scale is a tiny [H_q] reduction — compute in Python
+            # after replay (not inside the graph) to keep graph code simple.
+            d_relay_log_scale = (
+                (s_d_rk.float() * s_rk.float()).sum(dim=(0, 2, 3))
+                + (s_d_rv.float() * s_rv.float()).sum(dim=(0, 2, 3))
+            )  # [H_q]; caller converts dtype if needed
+            return (s_dq.clone(), s_dk.clone(), s_dv.clone(),
+                    s_d_rk.clone(), s_d_rv.clone(), d_relay_log_scale)
+
     @staticmethod
     def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                 use_persistent: bool = False, kv_groups: int = 1,
@@ -2918,218 +3109,27 @@ class CronRootAttentionV14Function(torch.autograd.Function):
 
         else:
             # =============================================================
-            # 4-KERNEL BACKWARD (with relay, MHA and GQA)
+            # RELAY-ACTIVE BACKWARD  (S > RELAY_THRESHOLD = 255)
             # =============================================================
-            # GQA (kv_groups > 1): uses KV-head-centric local/strided kernels
-            # + GQA-aware relay backward.  MHA falls through to the original
-            # Q-head-centric path.
-            # =============================================================
-            dq = torch.empty_like(q)
-            dk = torch.zeros_like(k)  # Zero for atomic accumulation
-            dv = torch.zeros_like(v)  # Zero for atomic accumulation
-
-            # dQ-ONLY KERNEL (includes relay Phase 3 contribution to dQ)
-            # Supports both MHA (KV_GROUPS=1) and GQA via h//KV_GROUPS indexing.
-            num_tiles_m = (S + BLOCK_M - 1) // BLOCK_M
-            _cron_root_attn_bwd_dq_only_v14[(B, H_q, num_tiles_m)](
-                q, k, v, o, do, dq, L,
-                relay_k, relay_v,
-                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-                k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-                v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-                o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-                do.stride(0), do.stride(1), do.stride(2), do.stride(3),
-                dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
-                L.stride(0), L.stride(1), L.stride(2),
-                relay_k.stride(0), relay_k.stride(1), relay_k.stride(2), relay_k.stride(3),
-                relay_v.stride(0), relay_v.stride(1), relay_v.stride(2), relay_v.stride(3),
-                S=S, D=D, SQRT_N=SQRT_N,
-                NUM_RELAY=NUM_RELAY, BLOCK_RELAY=BLOCK_RELAY,
-                BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
-                BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
-                KV_GROUPS=ctx.kv_groups,
-                num_warps=_KW, num_stages=_KS,
-            )
-
-            # dK/dV: branch on kv_groups for correct head indexing
-            BLOCK_N = 32
-            BLOCK_Q = 32
-            num_tiles_n     = (S + BLOCK_N - 1) // BLOCK_N
-            num_strided_keys    = (S + SQRT_N - 1) // SQRT_N
-            BLOCK_Q_STRIDED     = 64
-            NUM_Q_TILES_STRIDED = 1 if S <= 256 else (2 if S <= 512 else 4)
-
-            if ctx.kv_groups > 1:
-                # ----------------------------------------------------------
-                # GQA path: KV-head-centric kernels (no H_q-fold atomics)
-                # ----------------------------------------------------------
-                # LOCAL dK/dV
-                _dkdv_local_phase_gqa[(B, H_kv, num_tiles_n)](
-                    q, k, v, o, do, dk, dv, L,
-                    q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-                    k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-                    v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-                    o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-                    do.stride(0), do.stride(1), do.stride(2), do.stride(3),
-                    dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
-                    dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
-                    L.stride(0), L.stride(1), L.stride(2),
-                    S=S, D=D, SQRT_N=SQRT_N,
-                    BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, BLOCK_Q=BLOCK_Q,
-                    KV_GROUPS=ctx.kv_groups,
-                    num_warps=_KW, num_stages=_KS,
+            if ctx.kv_groups != 1:
+                raise NotImplementedError(
+                    f"GQA (kv_groups={ctx.kv_groups}) is only supported for S <= "
+                    f"{CronRootAttentionV14Function.FUSED_BWD_THRESHOLD}. "
+                    f"Got S={S}. The long-seq backward kernels do not yet support GQA."
                 )
-                # STRIDED dK/dV
-                if num_strided_keys > 0:
-                    _dkdv_strided_key_centric_gqa[(num_strided_keys * NUM_Q_TILES_STRIDED, B, H_kv)](
-                        q, k, v, o, do, dk, dv, L,
-                        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-                        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-                        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-                        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-                        do.stride(0), do.stride(1), do.stride(2), do.stride(3),
-                        dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
-                        dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
-                        L.stride(0), L.stride(1), L.stride(2),
-                        S=S, D=D, SQRT_N=SQRT_N,
-                        BLOCK_Q=BLOCK_Q_STRIDED, BLOCK_D=BLOCK_D,
-                        KV_GROUPS=ctx.kv_groups, NUM_Q_TILES=NUM_Q_TILES_STRIDED,
-                        num_warps=_KW, num_stages=_KS,
-                    )
-                # RELAY dK/dV (GQA-aware: grid over H_kv, loops KV_GROUPS inside)
-                if NUM_RELAY > 0 and not skip_relay:
-                    d_relay_k = torch.zeros_like(relay_k)
-                    d_relay_v = torch.zeros_like(relay_v)
-                    BLOCK_Q_RELAY = 64
-                    _dkdv_relay_v14_gqa[(NUM_RELAY, B, H_kv)](
-                        q, relay_k, relay_v, o, do, d_relay_k, d_relay_v, L,
-                        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-                        relay_k.stride(0), relay_k.stride(1), relay_k.stride(2), relay_k.stride(3),
-                        relay_v.stride(0), relay_v.stride(1), relay_v.stride(2), relay_v.stride(3),
-                        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-                        do.stride(0), do.stride(1), do.stride(2), do.stride(3),
-                        d_relay_k.stride(0), d_relay_k.stride(1), d_relay_k.stride(2), d_relay_k.stride(3),
-                        d_relay_v.stride(0), d_relay_v.stride(1), d_relay_v.stride(2), d_relay_v.stride(3),
-                        L.stride(0), L.stride(1), L.stride(2),
-                        S=S, D=D, SQRT_N=SQRT_N,
-                        NUM_RELAY=NUM_RELAY,
-                        KV_GROUPS=ctx.kv_groups,
-                        BLOCK_Q=BLOCK_Q_RELAY, BLOCK_D=BLOCK_D,
-                    )
-                    # Gradient for learnable per-head relay scale.
-                    # d_log_scale[h] = sum_{b,r,d}(d_relay_k[:,h,:,:] * relay_k[:,h,:,:]
-                    #                            + d_relay_v[:,h,:,:] * relay_v[:,h,:,:])
-                    # Chain rule: relay_k_scaled = relay_k_unscaled * exp(log_scale)
-                    # So d_log_scale = sum(d_relay_k_scaled * relay_k_scaled)
-                    # (same formula for V)
-                    if ctx.relay_log_scale is not None:
-                        d_relay_log_scale = (
-                            (d_relay_k.float() * relay_k.float()).sum(dim=(0, 2, 3))
-                            + (d_relay_v.float() * relay_v.float()).sum(dim=(0, 2, 3))
-                        ).to(ctx.relay_log_scale.dtype)  # [H_kv]
-                    _BLOCK_D_RELAY = triton.next_power_of_2(D)
-                    _relay_scatter_bwd[(B * H_kv, NUM_RELAY)](
-                        d_relay_k, dk, relay_w,
-                        d_relay_k.stride(0), d_relay_k.stride(1), d_relay_k.stride(2), d_relay_k.stride(3),
-                        dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
-                        relay_w.stride(0), relay_w.stride(1), relay_w.stride(2), relay_w.stride(3),
-                        H_kv=H_kv,
-                        S=S, D=D, SQRT_N=SQRT_N, BLOCK_D=_BLOCK_D_RELAY,
-                    )
-                    _relay_scatter_bwd[(B * H_kv, NUM_RELAY)](
-                        d_relay_v, dv, relay_w,
-                        d_relay_v.stride(0), d_relay_v.stride(1), d_relay_v.stride(2), d_relay_v.stride(3),
-                        dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
-                        relay_w.stride(0), relay_w.stride(1), relay_w.stride(2), relay_w.stride(3),
-                        H_kv=H_kv,
-                        S=S, D=D, SQRT_N=SQRT_N, BLOCK_D=_BLOCK_D_RELAY,
-                    )
-            else:
-                # ----------------------------------------------------------
-                # MHA path: original Q-head-centric kernels (unchanged)
-                # ----------------------------------------------------------
-                # LOCAL dK/dV - O(N√N) complexity
-                _dkdv_local_phase[(B, H_q, num_tiles_n)](
-                    q, k, v, o, do, dk, dv, L,
-                    q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-                    k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-                    v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-                    o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-                    do.stride(0), do.stride(1), do.stride(2), do.stride(3),
-                    dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
-                    dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
-                    L.stride(0), L.stride(1), L.stride(2),
-                    S=S, D=D, SQRT_N=SQRT_N,
-                    BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, BLOCK_Q=BLOCK_Q,
-                    num_warps=_KW, num_stages=_KS,
-                )
-                # KEY-CENTRIC STRIDED dK/dV
-                if num_strided_keys > 0:
-                    _dkdv_strided_key_centric[(num_strided_keys * NUM_Q_TILES_STRIDED, B, H_q)](
-                        q, k, v, o, do, dk, dv, L,
-                        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-                        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-                        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-                        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-                        do.stride(0), do.stride(1), do.stride(2), do.stride(3),
-                        dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
-                        dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
-                        L.stride(0), L.stride(1), L.stride(2),
-                        S=S, D=D, SQRT_N=SQRT_N,
-                        BLOCK_Q=BLOCK_Q_STRIDED, BLOCK_D=BLOCK_D,
-                        NUM_Q_TILES=NUM_Q_TILES_STRIDED,
-                        num_warps=_KW, num_stages=_KS,
-                    )
-                # RELAY dK/dV (MHA: grid over H_q)
-                if NUM_RELAY > 0 and not skip_relay:
-                    d_relay_k = torch.zeros_like(relay_k)
-                    d_relay_v = torch.zeros_like(relay_v)
-                    BLOCK_Q_RELAY = 64
-                    _dkdv_relay_v14[(NUM_RELAY, B, H_q)](
-                        q, relay_k, relay_v, o, do, d_relay_k, d_relay_v, L,
-                        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-                        relay_k.stride(0), relay_k.stride(1), relay_k.stride(2), relay_k.stride(3),
-                        relay_v.stride(0), relay_v.stride(1), relay_v.stride(2), relay_v.stride(3),
-                        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-                        do.stride(0), do.stride(1), do.stride(2), do.stride(3),
-                        d_relay_k.stride(0), d_relay_k.stride(1), d_relay_k.stride(2), d_relay_k.stride(3),
-                        d_relay_v.stride(0), d_relay_v.stride(1), d_relay_v.stride(2), d_relay_v.stride(3),
-                        L.stride(0), L.stride(1), L.stride(2),
-                        S=S, D=D, SQRT_N=SQRT_N,
-                        NUM_RELAY=NUM_RELAY,
-                        BLOCK_Q=BLOCK_Q_RELAY, BLOCK_D=BLOCK_D,
-                    )
-                    # Gradient for learnable per-head relay scale.
-                    # d_log_scale[h] = sum_{b,r,d}(d_relay_k[:,h,:,:] * relay_k[:,h,:,:]
-                    #                            + d_relay_v[:,h,:,:] * relay_v[:,h,:,:])
-                    if ctx.relay_log_scale is not None:
-                        d_relay_log_scale = (
-                            (d_relay_k.float() * relay_k.float()).sum(dim=(0, 2, 3))
-                            + (d_relay_v.float() * relay_v.float()).sum(dim=(0, 2, 3))
-                        ).to(ctx.relay_log_scale.dtype)  # [H_kv]
-                    # SCATTER RELAY GRADIENTS BACK TO dK, dV (norm²-weighted)
-                    _BLOCK_D_RELAY = triton.next_power_of_2(D)
-                    _relay_scatter_bwd[(B * H_kv, NUM_RELAY)](
-                        d_relay_k, dk, relay_w,
-                        d_relay_k.stride(0), d_relay_k.stride(1), d_relay_k.stride(2), d_relay_k.stride(3),
-                        dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
-                        relay_w.stride(0), relay_w.stride(1), relay_w.stride(2), relay_w.stride(3),
-                        H_kv=H_kv,
-                        S=S, D=D, SQRT_N=SQRT_N, BLOCK_D=_BLOCK_D_RELAY,
-                    )
-                    _relay_scatter_bwd[(B * H_kv, NUM_RELAY)](
-                        d_relay_v, dv, relay_w,
-                        d_relay_v.stride(0), d_relay_v.stride(1), d_relay_v.stride(2), d_relay_v.stride(3),
-                        dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
-                        relay_w.stride(0), relay_w.stride(1), relay_w.stride(2), relay_w.stride(3),
-                        H_kv=H_kv,
-                        S=S, D=D, SQRT_N=SQRT_N, BLOCK_D=_BLOCK_D_RELAY,
-                    )
-        
-        # ── Diagnostic: surface any backward Triton/graph errors here ─────
-        torch.cuda.synchronize(dq.device)
-        # ─────────────────────────────────────────────────────────────────────
-        return dq, dk, dv, None, None, d_relay_log_scale  # extra None for use_persistent, kv_groups; d_relay_log_scale for relay_log_scale arg
+            # MHA relay path: CUDA-graph-captured 6-kernel backward.
+            # Collapses dQ-only + local-dK/dV + strided-dK/dV + relay-dK/dV
+            # + relay_scatter×2 from ~300μs Python dispatch to ~5μs graph replay.
+            (dq, dk, dv,
+             d_relay_k, d_relay_v,
+             _d_rls_raw) = CronRootAttentionV14Function._relay4_graphed(
+                q, k, v, o, do, L, relay_k, relay_v, relay_w,
+                S, D, SQRT_N, NUM_RELAY,
+                BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE, BLOCK_RELAY, B, H_q)
+            if ctx.relay_log_scale is not None:
+                d_relay_log_scale = _d_rls_raw.to(ctx.relay_log_scale.dtype)
+
+        return dq, dk, dv, None, None, d_relay_log_scale  # extra None for use_persistent, kv_groups; d_relay_log_scale for relay_log_scale arg  # extra None for use_persistent, kv_groups; d_relay_log_scale for relay_log_scale arg
 
 
 # Tell torch.compile (Dynamo) to graph-break at the CronRoot boundary.
