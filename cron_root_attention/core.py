@@ -206,7 +206,14 @@ def _get_blackwell_kernel_config():
         return 4, 2, 1
     sm_major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
     if sm_major >= 12:   # Blackwell (SM 12.0: RTX 50xx, B100/B200)
-        return 8, 4, 2
+        # num_stages_fwd=4 assumes cudaFuncSetAttribute has raised the per-block
+        # shared memory limit to 228 KB (Blackwell maximum).  Without that call
+        # the default hardware limit is ~101 KB, and BLOCK_M=32/BLOCK_D=128/
+        # BLOCK_STRIDE=32 with 4 pipeline stages requires 119 KB → OOM.
+        # Using 2 fwd stages stays under 65 KB on all configurations.
+        # TODO: call cudaFuncSetAttribute(MaxDynamicSharedMemorySize, 228<<10) at
+        # kernel launch to re-enable 4 stages for full Blackwell throughput.
+        return 8, 2, 2
     if sm_major >= 9:    # Hopper (SM 9.0: H100/H200)
         return 8, 3, 2
     if sm_major >= 8:    # Ampere / Ada (SM 8.x: RTX 30/40xx, A100)
