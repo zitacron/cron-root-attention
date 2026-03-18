@@ -2260,12 +2260,15 @@ def _relay_precompute_fwd(
     SQRT_N: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
     """
-    Norm²-weighted relay precompute.
+    Norm²-weighted relay precompute — single-pass fused.
 
     Grid: (B * H_kv, NUM_RELAY)
     Each program processes one SQRT_N-element block, producing one slot of
     relay_k / relay_v (norm²-weighted K/V) and relay_w (per-position weights).
-    The last relay slot handles S % SQRT_N != 0 via masked loads.
+
+    Single-pass approach: accumulate norm²*K and norm²*V alongside total_norm_sq,
+    then divide at the end.  Eliminates the second K read entirely (saves
+    SQRT_N × D × 2 bytes of global memory bandwidth per relay block).
     """
     bh = tl.program_id(0)   # linearized (batch * H_kv)
     r  = tl.program_id(1)   # relay slot index
@@ -2281,34 +2284,13 @@ def _relay_precompute_fwd(
 
     k_base = K + b * stride_kb + h * stride_kh
     v_base = V + b * stride_vb + h * stride_vh
+    rw_base = relay_w + b * stride_rwb + h * stride_rwh + r * stride_rwr
 
-    # ------------------------------------------------------------------ #
-    # Pass 1: compute total ‖K‖² across the block (load K only, no V).   #
-    # total_norm_sq is a Python-float-initialized Triton scalar that       #
-    # accumulates tl.sum(k_row²) for each position.                       #
-    # ------------------------------------------------------------------ #
+    # ── Single pass: load K and V once, accumulate norm²*K, norm²*V,
+    #    total_norm_sq, and store per-position norm² for backward. ─────
     total_norm_sq = 0.0
-
-    for i in range(SQRT_N):
-        s_i     = s_start + i
-        valid_i = s_i < S
-        smask   = d_mask & valid_i
-        k_row   = tl.load(k_base + s_i * stride_ks + d_idx * stride_kd,
-                          mask=smask, other=0.0).to(tl.float32)
-        n_sq    = tl.sum(k_row * k_row)
-        n_sq    = tl.where(valid_i, n_sq, 0.0)
-        total_norm_sq = total_norm_sq + n_sq
-
-    inv_total = 1.0 / (total_norm_sq + 1e-8)
-
-    # ------------------------------------------------------------------ #
-    # Pass 2: reload K and V, recompute per-position ‖Kᵢ‖² to get wᵢ,   #
-    # accumulate weighted K/V sums, store wᵢ for backward scatter.       #
-    # (Reloading K is cheaper than SRAM-buffering SQRT_N scalars.)        #
-    # ------------------------------------------------------------------ #
     k_weighted = tl.zeros([BLOCK_D], dtype=tl.float32)
     v_weighted = tl.zeros([BLOCK_D], dtype=tl.float32)
-    rw_base = relay_w + b * stride_rwb + h * stride_rwh + r * stride_rwr
 
     for i in range(SQRT_N):
         s_i     = s_start + i
@@ -2320,11 +2302,22 @@ def _relay_precompute_fwd(
                           mask=smask, other=0.0).to(tl.float32)
         n_sq    = tl.sum(k_row * k_row)
         n_sq    = tl.where(valid_i, n_sq, 0.0)
-        w_i     = n_sq * inv_total
-        k_weighted = k_weighted + w_i * k_row
-        v_weighted = v_weighted + w_i * v_row
-        # Store weight for backward scatter
-        tl.store(rw_base + i * stride_rws, w_i.to(relay_w.dtype.element_ty))
+        total_norm_sq = total_norm_sq + n_sq
+        # Accumulate norm²-weighted sums (will normalize after loop)
+        k_weighted = k_weighted + n_sq * k_row
+        v_weighted = v_weighted + n_sq * v_row
+        # Store raw norm² per position (normalize to w_i after loop)
+        tl.store(rw_base + i * stride_rws, n_sq.to(relay_w.dtype.element_ty))
+
+    # ── Normalize: weighted_sum / total_norm_sq → relay_k/v ────────────
+    inv_total = 1.0 / (total_norm_sq + 1e-8)
+    k_weighted = k_weighted * inv_total
+    v_weighted = v_weighted * inv_total
+
+    # ── Normalize stored weights: w_i = norm²_i / total_norm_sq ────────
+    for i in range(SQRT_N):
+        raw = tl.load(rw_base + i * stride_rws).to(tl.float32)
+        tl.store(rw_base + i * stride_rws, (raw * inv_total).to(relay_w.dtype.element_ty))
 
     rk_ptr = relay_k + b * stride_rkb + h * stride_rkh + r * stride_rkr
     rv_ptr = relay_v + b * stride_rvb + h * stride_rvh + r * stride_rvr
@@ -2403,14 +2396,12 @@ class CronRootAttentionV14Function(torch.autograd.Function):
     """Autograd function for V14 tiled √N attention with 2-hop relay."""
     
     # Relay skip threshold: relay is skipped for sequences at or below this
-    # length.  Set to 0 to enable relay at ALL sequence lengths — this
-    # provides coverage for non-strided-multiple far tokens even at S=1024
-    # (SQRT_N=32: strided hits {0,32,64,...}; relay covers everything in
-    # between via the norm²-weighted block representative).
-    # Previously 8192 (relay was dead during 1K-sequence training).
-    # 255: ensures relay only activates at S>=256, where SQRT_N>=16 → BLOCK_STRIDE>=16
-    # (Triton tl.dot requires K>=16; at S=64 BLOCK_STRIDE=8 < 16 would crash).
-    RELAY_THRESHOLD = 255
+    # length.  At S<=2048, strided+local provides adequate O(√N) coverage
+    # (~64-90 attention targets per query via 2-hop reachability).
+    # Setting to 2048 enables GQA backward compatibility at all practical
+    # training seq lengths — the relay backward kernels only support MHA.
+    # For S>2048 inference/training, relay activates and MHA is required.
+    RELAY_THRESHOLD = 2048
     
     # Fused backward threshold: below this, use single-kernel backward
     # (fully fused dQ + local dK/dV + strided dK/dV) instead of 4-kernel approach.
