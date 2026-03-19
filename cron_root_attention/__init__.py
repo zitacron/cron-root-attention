@@ -75,9 +75,108 @@ Usage:
 __version__ = "0.1.0"
 __author__ = "Zitacron"
 
-from .core import cron_root_attention_v14, get_num_sms, GPU_SM_MAP
+from .core import cron_root_attention_v14, get_num_sms, GPU_SM_MAP, _tuner
 from .module import CronRootAttention, CronRootMultiheadAttention
 from .hybrid import cron_root_attention_hybrid, CronRootAttentionHybrid
+
+
+def calibrate(H: int = 8, D: int = 64, dtype=None,
+              S: int = 4096, verbose: bool = True) -> dict:
+    """Optional pre-warm: benchmark kernel configs for (H, D) before training.
+
+    Not required — the auto-tuner runs transparently on the first real forward
+    and backward calls.  Call this at model init for deterministic startup
+    (avoids a ~10ms inline benchmark on the first training step).
+
+    The optimal (num_warps, num_stages) depends on (GPU, H, D) only — it is
+    S-independent (verified empirically across S=512..131072).  A single test
+    at ``S`` (default 4096, always fits in VRAM) characterizes the GPU.
+
+    Args:
+        H:      Number of attention heads.
+        D:      Head dimension.
+        dtype:  Tensor dtype (default: torch.float16).
+        S:      Sequence length for the calibration run (default: 4096).
+        verbose:  Print results.
+
+    Returns:
+        dict with keys ``'fwd'`` and ``'bwd'``, each mapping to ``(num_warps, num_stages)``.
+    """
+    import torch, gc, math
+    if dtype is None:
+        dtype = torch.float16
+
+    # Check cache first
+    fwd_done = _tuner.is_tuned("fwd", H, D)
+    bwd_done = _tuner.is_tuned("bwd", H, D)
+    if fwd_done and bwd_done:
+        fwd_cfg = _tuner.get_config("fwd", H, D)
+        bwd_cfg = _tuner.get_config("bwd", H, D)
+        if verbose:
+            print(f"  H={H} D={D}: fwd=w{fwd_cfg[0]}s{fwd_cfg[1]}  "
+                  f"bwd=w{bwd_cfg[0]}s{bwd_cfg[1]}  (cached)")
+        return {"fwd": fwd_cfg, "bwd": bwd_cfg}
+
+    dev = torch.device("cuda", torch.cuda.current_device())
+    B = 1
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    SQRT_N = int(math.ceil(math.sqrt(S)))
+    NUM_RELAY = (S + SQRT_N - 1) // SQRT_N
+    BLOCK_M = BLOCK_D = BLOCK_LOCAL = BLOCK_STRIDE = BLOCK_RELAY = 64
+
+    q = torch.randn(B, H, S, D, device=dev, dtype=dtype)
+    k = torch.randn(B, H, S, D, device=dev, dtype=dtype)
+    v = torch.randn(B, H, S, D, device=dev, dtype=dtype)
+    o = torch.empty_like(q)
+    L = torch.empty(B, H, S, dtype=torch.float32, device=dev)
+    relay_k = torch.randn(B, H, NUM_RELAY, D, device=dev, dtype=dtype)
+    relay_v = torch.randn(B, H, NUM_RELAY, D, device=dev, dtype=dtype)
+
+    # ── Forward ───────────────────────────────────────────────────────
+    fwd_cfg = _tuner.tune_fwd_inline(
+        q, k, v, o, L, relay_k, relay_v,
+        S, D, SQRT_N, NUM_RELAY, BLOCK_RELAY,
+        BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE,
+        kv_groups=1, H_q=H, B=B)
+
+    # ── Backward (via dQ kernel, representative of all bwd kernels) ──
+    from .core import _cron_root_attn_bwd_dq_only_v14
+    num_tiles_m = (S + BLOCK_M - 1) // BLOCK_M
+    dq = torch.empty_like(q)
+    do_tensor = torch.randn_like(q)
+
+    bwd_cfg = _tuner.tune_bwd_inline(
+        _cron_root_attn_bwd_dq_only_v14,
+        (B, H, num_tiles_m),
+        (q, k, v, o, do_tensor, dq, L,
+         relay_k, relay_v,
+         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+         k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+         o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+         do_tensor.stride(0), do_tensor.stride(1), do_tensor.stride(2), do_tensor.stride(3),
+         dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
+         L.stride(0), L.stride(1), L.stride(2),
+         relay_k.stride(0), relay_k.stride(1), relay_k.stride(2), relay_k.stride(3),
+         relay_v.stride(0), relay_v.stride(1), relay_v.stride(2), relay_v.stride(3)),
+        dict(S=S, D=D, SQRT_N=SQRT_N,
+             NUM_RELAY=0, BLOCK_RELAY=BLOCK_RELAY,
+             BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
+             BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE),
+        H=H, D=D)
+
+    del q, k, v, o, L, relay_k, relay_v, dq, do_tensor
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    if verbose:
+        print(f"  H={H} D={D}: fwd=w{fwd_cfg[0]}s{fwd_cfg[1]}  "
+              f"bwd=w{bwd_cfg[0]}s{bwd_cfg[1]}  "
+              f"(saved to {_tuner._cache_file})")
+
+    return {"fwd": fwd_cfg, "bwd": bwd_cfg}
 
 
 def get_gpu_info() -> dict:
@@ -112,6 +211,7 @@ __all__ = [
     "CronRootMultiheadAttention",
     "cron_root_attention_hybrid",
     "CronRootAttentionHybrid",
+    "calibrate",
     "get_num_sms",
     "get_gpu_info",
     "GPU_SM_MAP",

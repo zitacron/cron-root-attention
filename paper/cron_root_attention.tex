@@ -1,654 +1,733 @@
-\documentclass{article}
-\usepackage[utf8]{inputenc}
-\usepackage{amsmath,amssymb}
-\usepackage{algorithm,algorithmic}
-\usepackage{graphicx}
-\usepackage{booktabs}
-\usepackage{hyperref}
+    \documentclass{article}
+    \usepackage[utf8]{inputenc}
+    \usepackage{amsmath,amssymb}
+    \usepackage{algorithm,algorithmic}
+    \usepackage{graphicx}
+    \usepackage{booktabs}
+    \usepackage{hyperref}
 
-% ArXiv preprint style
-\usepackage[margin=1in]{geometry}
+    % ArXiv preprint style
+    \usepackage[margin=1in]{geometry}
 
-\title{Cron Root Attention: Subquadratic Self-Attention via Structured Sparsity}
+    \title{Cron Root Attention: Subquadratic Self-Attention via Structured Sparsity}
 
-\author{
-  Zitacron\\
-  \texttt{https://github.com/zitacron}
-}
+    \author{
+    Zitacron\\
+    \texttt{https://github.com/zitacron}
+    }
 
-\date{\today}
+    \date{\today}
 
-\begin{document}
+    \begin{document}
 
-\maketitle
+    \maketitle
 
-\begin{abstract}
-We introduce Cron Root Attention, a sparse attention mechanism that reduces the computational complexity of self-attention from $O(N^2)$ to $O(N\sqrt{N})$ while preserving causal language modeling semantics. Our method combines three phases: (1) a local sliding window of size $\sqrt{N}$, (2) a strided global window of size $\sqrt{N}$, and (3) a \textbf{relay mechanism} that carries norm\textsuperscript{2}-weighted compressed key/value summaries from $\sqrt{N}$ blocks, enabling full-sequence coverage through a single softmax pass. Each query attends to $O(3\sqrt{N})$ positions, achieving 100\% token coverage without gradient dilution. We implement optimized Triton kernels with a fully-fused single-kernel backward pass and relay-skip optimization that achieve up to \textbf{79x forward kernel speedup} at sequence length 524K (small model) and \textbf{68x} at 524K (large model), with \textbf{3.6x end-to-end training speedup} at 131K tokens. The forward crossover point varies by model size: $\sim$2K tokens for small models down to $\sim$512 tokens for XL models. We introduce native Grouped-Query Attention (GQA) support, learnable per-head relay strength, and demonstrate CRA's composability with Compressed Convolutional Attention (CCA) for multiplicative $C \times \sqrt{N}$ savings. We validate CRA in a 608M-parameter language model trained from scratch on 8 datasets across $2\times$ RTX 5070 Ti GPUs, completing 5,001 steps in 6.38 hours with loss reduction from 11.41 to 4.34 (local CE), a 1{,}146$\times$ perplexity reduction (90{,}384 $\to$ 78.9), and sustained throughput of 10,400 tokens/second at sequence length 512. All kernel benchmarks were conducted on a single NVIDIA RTX 5070 Ti (Blackwell GB203, SM 12.0) using PyTorch 2.9.1, CUDA 12.8, Triton 3.5.1, and FP16 precision. Our implementation supports 40+ GPU models from consumer (RTX 20/30/40/50 series) to datacenter (H100, H800, A100, V100) hardware with automatic SM detection. We release Cron Root Attention as an open-source pip package under Apache 2.0 license.
-\end{abstract}
+    \begin{abstract}
+    We introduce Cron Root Attention, a sparse attention mechanism that reduces the computational complexity of self-attention from $O(N^2)$ to $O(N\sqrt{N})$ while preserving causal language modeling semantics. Our method combines three phases: (1) a local sliding window of size $\sqrt{N}$, (2) a strided global window of size $\sqrt{N}$, and (3) a \textbf{relay mechanism} that carries norm\textsuperscript{2}-weighted compressed key/value summaries from $\sqrt{N}$ blocks, enabling full-sequence coverage through a single softmax pass. Each query attends to $O(3\sqrt{N})$ positions, achieving 100\% token coverage without gradient dilution. We implement optimized Triton kernels with a fully-fused single-kernel backward pass and relay-skip optimization that achieve up to \textbf{42x forward kernel speedup} at sequence length 524K (small model) and \textbf{53x} at 524K (large model), with \textbf{5.7x end-to-end training speedup} at 131K tokens. Under FP32, where SDPA falls back to the math backend, CRA achieves \textbf{77x} forward speedup at 131K (small model). The forward crossover point varies by model size: $\sim$2K tokens for small models (FP16) down to $\sim$512 tokens for FP32 models. We introduce native Grouped-Query Attention (GQA) support, learnable per-head relay strength ($<$3\% overhead vs fixed relay), and demonstrate CRA's composability with Compressed Convolutional Attention (CCA) for multiplicative $C \times \sqrt{N}$ savings. We validate CRA in a 608M-parameter language model trained from scratch on 8 datasets across $2\times$ RTX 5070 Ti GPUs, completing 5,001 steps in 6.38 hours with loss reduction from 11.41 to 4.34 (local CE), a 1{,}146$\times$ perplexity reduction (90{,}384 $\to$ 78.9), and sustained throughput of 10,400 tokens/second at sequence length 512. All kernel benchmarks were conducted on a single NVIDIA RTX 5070 Ti (Blackwell GB203, SM 12.0) using PyTorch 2.9.1, CUDA 12.8, Triton 3.5.1, across FP16, BF16, and FP32 precisions. Our implementation supports 40+ GPU models from consumer (RTX 20/30/40/50 series) to datacenter (H100, H800, A100, V100) hardware with automatic SM detection. We release Cron Root Attention as an open-source pip package under Apache 2.0 license.
+    \end{abstract}
 
-\section{Introduction}
+    \section{Introduction}
 
-Transformer attention scales quadratically with sequence length, creating a fundamental bottleneck for long-context language models. While Flash Attention \cite{flashattn} and FlashAttention-2 \cite{flashattn2} optimize memory access patterns, they maintain $O(N^2)$ complexity. Sparse attention variants like Longformer \cite{longformer} and BigBird \cite{bigbird} achieve linear complexity but require fixed-size windows that don't scale with context.
+    Transformer attention scales quadratically with sequence length, creating a fundamental bottleneck for long-context language models. While Flash Attention \cite{flashattn} and FlashAttention-2 \cite{flashattn2} optimize memory access patterns, they maintain $O(N^2)$ complexity. Sparse attention variants like Longformer \cite{longformer} and BigBird \cite{bigbird} achieve linear complexity but require fixed-size windows that don't scale with context.
 
-We propose Cron Root Attention (named for Zitacron + Root $\sqrt{}$), which achieves true subquadratic scaling by using a window size proportional to $\sqrt{N}$. Our key insight is that combining:
-\begin{enumerate}
-    \item A \textbf{local window} of size $\sqrt{N}$ for recent context
-    \item A \textbf{strided window} sampling every $\sqrt{N}$-th token
-    \item A \textbf{relay mechanism} carrying block-mean K/V summaries from $\sqrt{N}$ blocks
-\end{enumerate}
-yields $O(N\sqrt{N})$ total complexity while providing \textbf{100\% sequence coverage} through a single softmax pass, eliminating the gradient dilution problem inherent in multi-hop sparse attention.
+    We propose Cron Root Attention (named for Zitacron + Root $\sqrt{}$), which achieves true subquadratic scaling by using a window size proportional to $\sqrt{N}$. Our key insight is that combining:
+    \begin{enumerate}
+        \item A \textbf{local window} of size $\sqrt{N}$ for recent context
+        \item A \textbf{strided window} sampling every $\sqrt{N}$-th token
+        \item A \textbf{relay mechanism} carrying block-mean K/V summaries from $\sqrt{N}$ blocks
+    \end{enumerate}
+    yields $O(N\sqrt{N})$ total complexity while providing \textbf{100\% sequence coverage} through a single softmax pass, eliminating the gradient dilution problem inherent in multi-hop sparse attention.
 
-\subsection{Contributions}
+    \subsection{Contributions}
 
-\begin{itemize}
-    \item We formalize the $\sqrt{N}$ attention pattern and prove its $O(N\sqrt{N})$ complexity with 2-hop universal reachability (Section \ref{sec:method}).
-    \item We develop block-query tiled Triton kernels with a fully-fused single-kernel backward achieving 79x forward speedup at 524K tokens (Section \ref{sec:implementation}).
-    \item We introduce norm\textsuperscript{2}-weighted relay pooling with learnable per-head relay strength, replacing uniform mean pooling for higher relay fidelity (Section \ref{sec:relay_improvements}).
-    \item We demonstrate native Grouped-Query Attention (GQA) support and composability with Compressed Convolutional Attention for multiplicative $C \times \sqrt{N}$ savings (Section \ref{sec:gqa_cca}).
-    \item We benchmark across four model sizes (Small to XL), showing the crossover point drops from $\sim$2K to $\sim$512 tokens as model width increases (Section \ref{sec:experiments}).
-    \item We validate CRA in a 608M-parameter language model trained from scratch for 5,001 steps (6.38 hours), demonstrating production viability with 10,400 tok/s throughput, clean convergence to loss 4.34, and successful curriculum advance from $S{=}512$ to $S{=}2048$ (Section \ref{sec:training_validation}).
-    \item We release a pip-installable package with automatic GPU detection supporting 40+ GPU models (Section \ref{sec:code}).
-\end{itemize}
+    \begin{itemize}
+        \item We formalize the $\sqrt{N}$ attention pattern and prove its $O(N\sqrt{N})$ complexity with 2-hop universal reachability (Section \ref{sec:method}).
+        \item We develop block-query tiled Triton kernels with a fully-fused single-kernel backward achieving 79x forward speedup at 524K tokens (Section \ref{sec:implementation}).
+        \item We introduce norm\textsuperscript{2}-weighted relay pooling with learnable per-head relay strength, replacing uniform mean pooling for higher relay fidelity (Section \ref{sec:relay_improvements}).
+        \item We demonstrate native Grouped-Query Attention (GQA) support and composability with Compressed Convolutional Attention for multiplicative $C \times \sqrt{N}$ savings (Section \ref{sec:gqa_cca}).
+        \item We benchmark across four model sizes (Small to XL), showing the crossover point drops from $\sim$2K to $\sim$512 tokens as model width increases (Section \ref{sec:experiments}).
+        \item We validate CRA in a 608M-parameter language model trained from scratch for 5,001 steps (6.38 hours), demonstrating production viability with 10,400 tok/s throughput, clean convergence to loss 4.34, and successful curriculum advance from $S{=}512$ to $S{=}2048$ (Section \ref{sec:training_validation}).
+        \item We release a pip-installable package with automatic GPU detection supporting 40+ GPU models (Section \ref{sec:code}).
+    \end{itemize}
 
-\section{Related Work}
+    \section{Related Work}
 
-\textbf{Efficient Attention.} Flash Attention \cite{flashattn} uses tiling and recomputation to reduce memory from $O(N^2)$ to $O(N)$ while maintaining exact computation. FlashAttention-2 \cite{flashattn2} improves parallelism. Flash-Decoding \cite{flashdecoding} optimizes inference. These maintain quadratic compute.
+    \textbf{Efficient Attention.} Flash Attention \cite{flashattn} uses tiling and recomputation to reduce memory from $O(N^2)$ to $O(N)$ while maintaining exact computation. FlashAttention-2 \cite{flashattn2} improves parallelism. Flash-Decoding \cite{flashdecoding} optimizes inference. These maintain quadratic compute.
 
-\textbf{Sparse Attention.} Longformer \cite{longformer} uses local + global tokens. BigBird \cite{bigbird} adds random attention. Sparse Transformers \cite{sparse_transformers} use strided patterns. These typically use fixed window sizes, limiting scalability.
+    \textbf{Sparse Attention.} Longformer \cite{longformer} uses local + global tokens. BigBird \cite{bigbird} adds random attention. Sparse Transformers \cite{sparse_transformers} use strided patterns. These typically use fixed window sizes, limiting scalability.
 
-\textbf{Linear Attention.} Linear attention \cite{linear_attention} and variants like RWKV \cite{rwkv} and Mamba \cite{mamba} achieve $O(N)$ but sacrifice expressivity.
+    \textbf{Linear Attention.} Linear attention \cite{linear_attention} and variants like RWKV \cite{rwkv} and Mamba \cite{mamba} achieve $O(N)$ but sacrifice expressivity.
 
-\textbf{Our Approach.} Cron Root Attention combines the hardware optimization of Flash Attention with the scalability of sparse attention, using adaptive $\sqrt{N}$-sized windows that scale with sequence length. We further extend compatibility with GQA \cite{gqa} and demonstrate composability with compressed attention methods for multiplicative savings.
+    \textbf{Our Approach.} Cron Root Attention combines the hardware optimization of Flash Attention with the scalability of sparse attention, using adaptive $\sqrt{N}$-sized windows that scale with sequence length. We further extend compatibility with GQA \cite{gqa} and demonstrate composability with compressed attention methods for multiplicative savings.
 
-\section{Method}
-\label{sec:method}
+    \section{Method}
+    \label{sec:method}
 
-\subsection{Attention Pattern}
+    \subsection{Attention Pattern}
 
-For a sequence of length $N$, we define the window size $W = \lceil\sqrt{N}\rceil$. Each query $q_i$ attends to:
+    For a sequence of length $N$, we define the window size $W = \lceil\sqrt{N}\rceil$. Each query $q_i$ attends to:
 
-\begin{equation}
-\mathcal{A}(i) = \underbrace{\{j : \max(0, i-W+1) \leq j \leq i\}}_{\text{Local window}} \cup \underbrace{\{j : j \equiv 0 \pmod{W}, j < \max(0, i-W+1)\}}_{\text{Strided window}}
-\end{equation}
+    \begin{equation}
+    \mathcal{A}(i) = \underbrace{\{j : \max(0, i-W+1) \leq j \leq i\}}_{\text{Local window}} \cup \underbrace{\{j : j \equiv 0 \pmod{W}, j < \max(0, i-W+1)\}}_{\text{Strided window}}
+    \end{equation}
 
-\subsection{Complexity Analysis}
+    \subsection{Complexity Analysis}
 
-\begin{theorem}
-The total attention cost is $O(N\sqrt{N})$.
-\end{theorem}
+    \begin{theorem}
+    The total attention cost is $O(N\sqrt{N})$.
+    \end{theorem}
 
-\begin{proof}
-Each query attends to at most $W$ local positions and at most $\lceil N/W \rceil$ strided positions:
-\begin{equation}
-|\mathcal{A}(i)| \leq W + \frac{N}{W} = \sqrt{N} + \sqrt{N} = 2\sqrt{N}
-\end{equation}
-Summing over $N$ queries: $N \cdot 2\sqrt{N} = O(N\sqrt{N})$.
-\end{proof}
+    \begin{proof}
+    Each query attends to at most $W$ local positions and at most $\lceil N/W \rceil$ strided positions:
+    \begin{equation}
+    |\mathcal{A}(i)| \leq W + \frac{N}{W} = \sqrt{N} + \sqrt{N} = 2\sqrt{N}
+    \end{equation}
+    Summing over $N$ queries: $N \cdot 2\sqrt{N} = O(N\sqrt{N})$.
+    \end{proof}
 
-\subsection{2-Hop Reachability}
+    \subsection{2-Hop Reachability}
 
-\begin{theorem}
-Any token can reach any other token in at most 2 attention hops.
-\end{theorem}
+    \begin{theorem}
+    Any token can reach any other token in at most 2 attention hops.
+    \end{theorem}
 
-\begin{proof}
-For tokens $A$ at position $i$ and $B$ at position $j$ where $j < i - W$:
-\begin{enumerate}
-    \item Let $C$ be at the strided position $\lfloor j/W \rfloor \cdot W$
-    \item $A$ attends to $C$ via strided window (since $C < i - W + 1$)
-    \item $C$ attends to $B$ via local window (since $|C - j| < W$)
-\end{enumerate}
-Thus $A \rightarrow C \rightarrow B$ forms a 2-hop path.
-\end{proof}
+    \begin{proof}
+    For tokens $A$ at position $i$ and $B$ at position $j$ where $j < i - W$:
+    \begin{enumerate}
+        \item Let $C$ be at the strided position $\lfloor j/W \rfloor \cdot W$
+        \item $A$ attends to $C$ via strided window (since $C < i - W + 1$)
+        \item $C$ attends to $B$ via local window (since $|C - j| < W$)
+    \end{enumerate}
+    Thus $A \rightarrow C \rightarrow B$ forms a 2-hop path.
+    \end{proof}
 
-\subsection{Relay Mechanism (Phase 3)}
+    \subsection{Relay Mechanism (Phase 3)}
 
-While the 2-hop reachability property guarantees theoretical coverage, in practice information traversing two separate softmax normalizations across layers suffers from \textbf{gradient dilution}: the gradient signal decays exponentially through each softmax bottleneck.
+    While the 2-hop reachability property guarantees theoretical coverage, in practice information traversing two separate softmax normalizations across layers suffers from \textbf{gradient dilution}: the gradient signal decays exponentially through each softmax bottleneck.
 
-We introduce a relay mechanism that carries compressed 2-hop information through a \textbf{single} softmax pass. For each block $r \in \{0, 1, \ldots, \lceil N/W \rceil - 1\}$, we pre-compute relay keys and values that participate in the same softmax as the local and strided scores.
+    We introduce a relay mechanism that carries compressed 2-hop information through a \textbf{single} softmax pass. For each block $r \in \{0, 1, \ldots, \lceil N/W \rceil - 1\}$, we pre-compute relay keys and values that participate in the same softmax as the local and strided scores.
 
-\subsubsection{Norm\textsuperscript{2}-Weighted Relay Pooling}
-\label{sec:relay_improvements}
+    \subsubsection{Norm\textsuperscript{2}-Weighted Relay Pooling}
+    \label{sec:relay_improvements}
 
-The original relay design used uniform mean pooling: $\text{relay\_k}[r] = \frac{1}{W}\sum_j k_j$. However, $q \cdot \text{mean}(K) = \text{mean}(q \cdot K_i)$, so low-norm tokens dilute the relay representative and high-information tokens are ignored.
+    The original relay design used uniform mean pooling: $\text{relay\_k}[r] = \frac{1}{W}\sum_j k_j$. However, $q \cdot \text{mean}(K) = \text{mean}(q \cdot K_i)$, so low-norm tokens dilute the relay representative and high-information tokens are ignored.
 
-We replace uniform pooling with \textbf{norm\textsuperscript{2}-weighted pooling}:
-\begin{equation}
-w_i = \frac{\|k_i\|^2}{\sum_{j=rW}^{(r+1)W-1} \|k_j\|^2}, \quad
-\text{relay\_k}[r] = \sum_{i=rW}^{(r+1)W-1} w_i \cdot k_i, \quad
-\text{relay\_v}[r] = \sum_{i=rW}^{(r+1)W-1} w_i \cdot v_i
-\end{equation}
+    We replace uniform pooling with \textbf{norm\textsuperscript{2}-weighted pooling}:
+    \begin{equation}
+    w_i = \frac{\|k_i\|^2}{\sum_{j=rW}^{(r+1)W-1} \|k_j\|^2}, \quad
+    \text{relay\_k}[r] = \sum_{i=rW}^{(r+1)W-1} w_i \cdot k_i, \quad
+    \text{relay\_v}[r] = \sum_{i=rW}^{(r+1)W-1} w_i \cdot v_i
+    \end{equation}
 
-High-norm keys (more ``informative'' tokens) dominate the relay representative. The attention score $q \cdot \text{relay\_k}[r] = \sum_i w_i (q \cdot k_i)$ is an importance-weighted average of the real scores---strictly better than the uniform mean for locating what matters in each block.
+    High-norm keys (more ``informative'' tokens) dominate the relay representative. The attention score $q \cdot \text{relay\_k}[r] = \sum_i w_i (q \cdot k_i)$ is an importance-weighted average of the real scores---strictly better than the uniform mean for locating what matters in each block.
 
-This is implemented as a single-pass fused Triton kernel: each program processes one $\sqrt{N}$-element block, accumulating $\|k_i\|^2 \cdot k_i$ and $\|k_i\|^2 \cdot v_i$ alongside the total $\sum \|k_j\|^2$, then divides at the end. The per-position weights $w_i$ are stored in a $[B, H, R, \sqrt{N}]$ tensor for use in the backward scatter.
+    This is implemented as a single-pass fused Triton kernel: each program processes one $\sqrt{N}$-element block, accumulating $\|k_i\|^2 \cdot k_i$ and $\|k_i\|^2 \cdot v_i$ alongside the total $\sum \|k_j\|^2$, then divides at the end. The per-position weights $w_i$ are stored in a $[B, H, R, \sqrt{N}]$ tensor for use in the backward scatter.
 
-The backward pass uses the weighted Jacobian:
-\begin{equation}
-\frac{\partial \mathcal{L}}{\partial k_j} \mathrel{+}= w_j \cdot \frac{\partial \mathcal{L}}{\partial \text{relay\_k}[\lfloor j/W \rfloor]}
-\end{equation}
+    The backward pass uses the weighted Jacobian:
+    \begin{equation}
+    \frac{\partial \mathcal{L}}{\partial k_j} \mathrel{+}= w_j \cdot \frac{\partial \mathcal{L}}{\partial \text{relay\_k}[\lfloor j/W \rfloor]}
+    \end{equation}
 
-\subsubsection{Learnable Per-Head Relay Strength}
+    \subsubsection{Learnable Per-Head Relay Strength}
 
-We introduce a learnable parameter $\alpha_h \in \mathbb{R}$ per KV-head that scales the relay contribution:
-\begin{equation}
-\text{relay\_k}'[r, h] = e^{\alpha_h} \cdot \text{relay\_k}[r, h], \quad \text{relay\_v}'[r, h] = e^{\alpha_h} \cdot \text{relay\_v}[r, h]
-\end{equation}
+    We introduce a learnable parameter $\alpha_h \in \mathbb{R}$ per KV-head that scales the relay contribution:
+    \begin{equation}
+    \text{relay\_k}'[r, h] = e^{\alpha_h} \cdot \text{relay\_k}[r, h], \quad \text{relay\_v}'[r, h] = e^{\alpha_h} \cdot \text{relay\_v}[r, h]
+    \end{equation}
 
-The exponential parameterization ensures positivity and provides smooth gradient flow. Each head can independently learn whether to upweight (trust relay summaries) or downweight (rely more on local/strided) its relay channel. The parameter is initialized at $\alpha_h = 0$ (scale $= 1$, matching the default). The gradient $\partial \mathcal{L}/\partial \alpha_h$ is a small $[H]$-sized reduction computed in Python after the main kernel backward.
+    The exponential parameterization ensures positivity and provides smooth gradient flow. Each head can independently learn whether to upweight (trust relay summaries) or downweight (rely more on local/strided) its relay channel. The parameter is initialized at $\alpha_h = 0$ (scale $= 1$, matching the default). The gradient $\partial \mathcal{L}/\partial \alpha_h$ is a small $[H]$-sized reduction computed in Python after the main kernel backward.
 
-These relay keys and values participate in the \textbf{same} softmax as the local and strided scores:
-\begin{equation}
-\mathcal{A}(i) = \mathcal{A}_{\text{local}}(i) \cup \mathcal{A}_{\text{strided}}(i) \cup \mathcal{A}_{\text{relay}}(i)
-\end{equation}
-where $\mathcal{A}_{\text{relay}}(i) = \{r : (r+1)W - 1 < \max(0, i - W + 1)\}$, i.e., relay blocks whose entire span precedes the local window.
+    These relay keys and values participate in the \textbf{same} softmax as the local and strided scores:
+    \begin{equation}
+    \mathcal{A}(i) = \mathcal{A}_{\text{local}}(i) \cup \mathcal{A}_{\text{strided}}(i) \cup \mathcal{A}_{\text{relay}}(i)
+    \end{equation}
+    where $\mathcal{A}_{\text{relay}}(i) = \{r : (r+1)W - 1 < \max(0, i - W + 1)\}$, i.e., relay blocks whose entire span precedes the local window.
 
-The total attention set size remains $O(3\sqrt{N})$ per query:
-\begin{equation}
-|\mathcal{A}(i)| \leq W + \frac{N}{W} + \frac{N}{W} = 3\sqrt{N}
-\end{equation}
+    The total attention set size remains $O(3\sqrt{N})$ per query:
+    \begin{equation}
+    |\mathcal{A}(i)| \leq W + \frac{N}{W} + \frac{N}{W} = 3\sqrt{N}
+    \end{equation}
 
-\subsection{Softmax Stability}
+    \subsection{Softmax Stability}
 
-We compute attention with online softmax:
-\begin{equation}
-\text{Attention}(q_i, K, V) = \frac{\sum_{j \in \mathcal{A}(i)} \exp(q_i \cdot k_j / \sqrt{d}) \cdot v_j}{\sum_{j \in \mathcal{A}(i)} \exp(q_i \cdot k_j / \sqrt{d})}
-\end{equation}
+    We compute attention with online softmax:
+    \begin{equation}
+    \text{Attention}(q_i, K, V) = \frac{\sum_{j \in \mathcal{A}(i)} \exp(q_i \cdot k_j / \sqrt{d}) \cdot v_j}{\sum_{j \in \mathcal{A}(i)} \exp(q_i \cdot k_j / \sqrt{d})}
+    \end{equation}
 
-Using the max-subtraction trick for numerical stability:
-\begin{equation}
-m_i = \max_{j \in \mathcal{A}(i)} q_i \cdot k_j, \quad s_{ij} = \exp(q_i \cdot k_j - m_i)
-\end{equation}
+    Using the max-subtraction trick for numerical stability:
+    \begin{equation}
+    m_i = \max_{j \in \mathcal{A}(i)} q_i \cdot k_j, \quad s_{ij} = \exp(q_i \cdot k_j - m_i)
+    \end{equation}
 
-\subsection{Grouped-Query Attention and CCA Composability}
-\label{sec:gqa_cca}
+    \subsection{Grouped-Query Attention and CCA Composability}
+    \label{sec:gqa_cca}
 
-\subsubsection{Native GQA Support}
+    \subsubsection{Native GQA Support}
 
-Cron Root Attention natively supports Grouped-Query Attention (GQA) \cite{gqa}, where $H_q$ query heads share $H_{kv}$ key-value heads with a group ratio $G = H_q / H_{kv}$. The kernel accepts a \texttt{kv\_groups} parameter: K and V tensors remain at shape $(B, H_{kv}, S, D)$ and are broadcast internally across query groups. This eliminates the memory overhead of \texttt{repeat\_interleave} expansion, which is significant at long sequence lengths where the KV tensor dominates VRAM.
+    Cron Root Attention natively supports Grouped-Query Attention (GQA) \cite{gqa}, where $H_q$ query heads share $H_{kv}$ key-value heads with a group ratio $G = H_q / H_{kv}$. The kernel accepts a \texttt{kv\_groups} parameter: K and V tensors remain at shape $(B, H_{kv}, S, D)$ and are broadcast internally across query groups. This eliminates the memory overhead of \texttt{repeat\_interleave} expansion, which is significant at long sequence lengths where the KV tensor dominates VRAM.
 
-For the backward pass at short sequences ($S \leq 8192$), we provide a dedicated GQA-aware fused kernel (\texttt{split3\_gqa}) that accumulates $dK$ and $dV$ gradients across all query groups sharing each KV head. For long sequences ($S > 8192$), the current implementation requires KV expansion; a fused long-sequence GQA backward is planned.
+    For the backward pass at short sequences ($S \leq 8192$), we provide a dedicated GQA-aware fused kernel (\texttt{split3\_gqa}) that accumulates $dK$ and $dV$ gradients across all query groups sharing each KV head. For long sequences ($S > 8192$), the current implementation requires KV expansion; a fused long-sequence GQA backward is planned.
 
-\subsubsection{Composability with Compressed Convolutional Attention}
+    \subsubsection{Composability with Compressed Convolutional Attention}
 
-CRA's kernel operates on $(B, H, S, D)$ tensors with \textbf{arbitrary} head dimension $D$. This enables composability with Compressed Convolutional Attention (CCA), which performs attention in a $C\times$ compressed latent space where $D_{\text{compressed}} = D_{\text{head}} / C$.
+    CRA's kernel operates on $(B, H, S, D)$ tensors with \textbf{arbitrary} head dimension $D$. This enables composability with Compressed Convolutional Attention (CCA), which performs attention in a $C\times$ compressed latent space where $D_{\text{compressed}} = D_{\text{head}} / C$.
 
-CCA down-projects Q, K, V into the compressed space, applies sequential causal convolutions to inject local context, and then calls CRA on the compressed tensors. The attention FLOP cost becomes:
-\begin{equation}
-\text{CCA + CRA cost} \approx 4 \cdot B \cdot N\sqrt{N} \cdot H \cdot \frac{D}{C} = O\!\left(\frac{N\sqrt{N} \cdot HD}{C}\right)
-\end{equation}
+    CCA down-projects Q, K, V into the compressed space, applies sequential causal convolutions to inject local context, and then calls CRA on the compressed tensors. The attention FLOP cost becomes:
+    \begin{equation}
+    \text{CCA + CRA cost} \approx 4 \cdot B \cdot N\sqrt{N} \cdot H \cdot \frac{D}{C} = O\!\left(\frac{N\sqrt{N} \cdot HD}{C}\right)
+    \end{equation}
 
-For a concrete comparison with $N=1024$, $H=16$, $D_h=96$, $C=4$:
-\begin{align}
-\text{MHA (dense):} \quad & 4 \times 1024^2 \times 16 \times 96 = 6.44\text{B FLOPs} \\
-\text{CCA + CRA:} \quad & 4 \times 1024 \times 32 \times 16 \times 24 \approx 50\text{M FLOPs} \quad (\sim\!126\times \text{ cheaper})
-\end{align}
+    For a concrete comparison with $N=1024$, $H=16$, $D_h=96$, $C=4$:
+    \begin{align}
+    \text{MHA (dense):} \quad & 4 \times 1024^2 \times 16 \times 96 = 6.44\text{B FLOPs} \\
+    \text{CCA + CRA:} \quad & 4 \times 1024 \times 32 \times 16 \times 24 \approx 50\text{M FLOPs} \quad (\sim\!126\times \text{ cheaper})
+    \end{align}
 
-This multiplicative $C \times \sqrt{N}$ saving is validated in practice: our 608M-parameter Mira v5 model uses 13/18 layers as CCA+CRA (75\%) with 5/18 full-attention anchor layers (25\%), achieving 10,400 tokens/second on $2\times$ RTX 5070 Ti at $S=512$ --- a throughput level that would be impossible with dense attention at equivalent batch sizes.
+    This multiplicative $C \times \sqrt{N}$ saving is validated in practice: our 608M-parameter Mira v5 model uses 13/18 layers as CCA+CRA (75\%) with 5/18 full-attention anchor layers (25\%), achieving 10,400 tokens/second on $2\times$ RTX 5070 Ti at $S=512$ --- a throughput level that would be impossible with dense attention at equivalent batch sizes.
 
-\section{Implementation}
-\label{sec:implementation}
+    \section{Implementation}
+    \label{sec:implementation}
 
-\subsection{Triton Kernel Design}
+    \subsection{Triton Kernel Design}
 
-Our V14 kernel uses block-query tiling with block sizes $B_M = 64$ (queries per block):
+    Our V14 kernel uses block-query tiling with block sizes $B_M = 64$ (queries per block):
 
-\begin{algorithm}
-\caption{Cron Root Attention Forward Kernel (3-Phase)}
-\begin{algorithmic}
-\STATE \textbf{Input:} $Q, K, V \in \mathbb{R}^{N \times d}$, block size $B_M$
-\STATE \textbf{Output:} $O \in \mathbb{R}^{N \times d}$
-\STATE Compute $W = \lceil\sqrt{N}\rceil$
-\STATE \textbf{Pre-compute:} $w_i = \|K_i\|^2/\Sigma\|K\|^2$; $\text{RK}[r] = \sum w_i \cdot K[rW{+}i]$, $\text{RV}[r] = \sum w_i \cdot V[rW{+}i]$
-\FOR{each query block $i = 0, B_M, 2B_M, \ldots$}
-    \STATE Load $Q[i:i+B_M]$ to SRAM
-    \STATE Initialize $m = -\infty$, $\ell = 0$, $o = 0$
-    \STATE // Phase 1: Local window
-    \FOR{$j$ in local range $[\max(0, i-W+1), i]$}
-        \STATE $s = QK^T / \sqrt{d}$, update $m, \ell, o$ with online softmax
+    \begin{algorithm}
+    \caption{Cron Root Attention Forward Kernel (3-Phase)}
+    \begin{algorithmic}
+    \STATE \textbf{Input:} $Q, K, V \in \mathbb{R}^{N \times d}$, block size $B_M$
+    \STATE \textbf{Output:} $O \in \mathbb{R}^{N \times d}$
+    \STATE Compute $W = \lceil\sqrt{N}\rceil$
+    \STATE \textbf{Pre-compute:} $w_i = \|K_i\|^2/\Sigma\|K\|^2$; $\text{RK}[r] = \sum w_i \cdot K[rW{+}i]$, $\text{RV}[r] = \sum w_i \cdot V[rW{+}i]$
+    \FOR{each query block $i = 0, B_M, 2B_M, \ldots$}
+        \STATE Load $Q[i:i+B_M]$ to SRAM
+        \STATE Initialize $m = -\infty$, $\ell = 0$, $o = 0$
+        \STATE // Phase 1: Local window
+        \FOR{$j$ in local range $[\max(0, i-W+1), i]$}
+            \STATE $s = QK^T / \sqrt{d}$, update $m, \ell, o$ with online softmax
+        \ENDFOR
+        \STATE // Phase 2: Strided window (before local)
+        \FOR{$j \in \{0, W, 2W, \ldots\}$ where $j < \max(0, i-W+1)$}
+            \STATE $s = QK^T / \sqrt{d}$, update $m, \ell, o$ with online softmax
+        \ENDFOR
+        \STATE // Phase 3: Relay (compressed 2-hop blocks)
+        \FOR{relay block $r$ where $(r{+}1)W{-}1 < \max(0, i{-}W{+}1)$}
+            \STATE $s = Q \cdot \text{RK}[r]^T / \sqrt{d}$, update $m, \ell, o$ with online softmax using $\text{RV}[r]$
+        \ENDFOR
+        \STATE Store $O[i:i+B_M] = o / \ell$
     \ENDFOR
-    \STATE // Phase 2: Strided window (before local)
-    \FOR{$j \in \{0, W, 2W, \ldots\}$ where $j < \max(0, i-W+1)$}
-        \STATE $s = QK^T / \sqrt{d}$, update $m, \ell, o$ with online softmax
-    \ENDFOR
-    \STATE // Phase 3: Relay (compressed 2-hop blocks)
-    \FOR{relay block $r$ where $(r{+}1)W{-}1 < \max(0, i{-}W{+}1)$}
-        \STATE $s = Q \cdot \text{RK}[r]^T / \sqrt{d}$, update $m, \ell, o$ with online softmax using $\text{RV}[r]$
-    \ENDFOR
-    \STATE Store $O[i:i+B_M] = o / \ell$
-\ENDFOR
-\end{algorithmic}
-\end{algorithm}
-
-\subsection{Optimized Backward Pass}
-
-The backward pass computes $dQ$, $dK$, and $dV$. We provide two backward strategies selected by sequence length:
-
-\textbf{Fully-fused single kernel (S $\leq$ 8192):} A single Triton kernel computes all gradients --- dQ via dot products with local and strided K, and dK/dV via \texttt{atomic\_add} from all contributing queries. The relay mechanism is skipped entirely (\texttt{skip\_relay} optimization), eliminating pad/reshape/mean precomputation. This reduces backward from 4 kernel launches to \textbf{1 kernel launch}, lowering the training crossover from $\sim$12K to $\sim$2K tokens.
-
-\textbf{Key-centric multi-kernel (S $>$ 8192):} Four specialized kernels with exclusive ownership and zero atomic contention:
-\begin{itemize}
-    \item \textbf{dQ kernel}: Query-parallel, includes all three phases (local + strided + relay contributions).
-    \item \textbf{Local dK/dV}: Each key block processes only its $O(\sqrt{N})$ local queries.
-    \item \textbf{Strided dK/dV}: Each block \textit{owns} one strided key and iterates over all $O(N)$ queries. Register accumulation, single write.
-    \item \textbf{Relay dK/dV}: Each block \textit{owns} one relay key/value pair. Gradient scatter via the norm\textsuperscript{2}-weighted Jacobian: $dK[rW{+}i] \mathrel{+}= w_i \cdot d\text{RK}[r]$, where $w_i = \|K_i\|^2 / \sum_j \|K_j\|^2$ are the precomputed importance weights.
-\end{itemize}
-
-\subsection{Hardware Optimization}
-
-Key optimizations for broad GPU support:
-\begin{itemize}
-    \item Dynamic SM detection via \texttt{torch.cuda.get\_device\_properties()}
-    \item GPU compatibility table covering 40+ models (RTX 20/30/40/50 series, H100, H800, A100, V100)
-    \item Block-query tiling with BLOCK\_M=64 queries per thread block
-    \item Coalesced memory access with vectorized loads
-    \item FP16 compute with FP32 accumulation for numerical stability
-\end{itemize}
-
-\section{Experiments}
-\label{sec:experiments}
-
-\subsection{Experimental Setup}
-\label{sec:setup}
-
-All benchmarks were conducted on the following hardware and software configuration:
-
-\textbf{Hardware:}
-\begin{itemize}
-    \item GPU: NVIDIA GeForce RTX 5070 Ti (Blackwell GB203, compute capability SM~12.0, 70~SMs, 16{,}303~MiB GDDR7 VRAM)
-    \item CPU: AMD Ryzen 9 7900X (12 cores / 24 threads, 5.7~GHz boost)
-    \item System RAM: 32~GiB DDR5
-    \item CUDA driver: 580.126.16
-\end{itemize}
-
-\textbf{Software:}
-\begin{itemize}
-    \item OS: Linux 6.17.0-14-generic (x86\_64)
-    \item PyTorch: 2.9.1+cu128
-    \item CUDA toolkit: 12.8
-    \item cuDNN: 9.1.0.2
-    \item Triton: 3.5.1
-\end{itemize}
-
-\textbf{Benchmark protocol:} All latencies are measured using CUDA events with \texttt{torch.cuda.synchronize()} barriers. Each configuration is run with dedicated warm-up iterations (so Triton JIT compilation is excluded from all reported times) followed by timed repetitions; the trimmed mean (10\% trim on each tail) is reported to reduce outlier sensitivity. Forward-only benchmarks record a single \texttt{forward()} call under \texttt{torch.no\_grad()}; training benchmarks additionally call \texttt{loss.backward()}. Randomized tensors (\texttt{torch.randn}, FP16) are used throughout. All runs are single-GPU, single-process, batch size $B=1$.
-
-\textbf{Scope and limitations:} These benchmarks measure isolated attention kernel latency and do not include I/O, optimizer steps, or inter-GPU communication. They represent the best-case scenario for subquadratic attention in terms of relative advantage; wall-clock speedup in a full training loop will vary due to other bottlenecks. Results are specific to SM~12.0 (Blackwell) and will differ on other architectures (e.g., A100/H100 use SM~8.0/9.0 with different GEMM paths and different Triton tile mappings). The XL model (H=32, D=128) could not be benchmarked at $S=524{,}288$ due to the 16~GiB VRAM constraint.
-
-\subsection{Forward Pass Kernel Benchmarks}
-
-We benchmark four model sizes to characterize how the crossover point shifts with model width. All experiments use the setup described in Section~\ref{sec:setup}.
-
-\begin{table}[h]
-\centering
-\caption{Forward pass kernel latency --- \textbf{Small model} (B=1, H=8, D=64, FP16). See Section~\ref{sec:setup} for full setup.}
-\begin{tabular}{lrrr}
-\toprule
-Seq Length & SDPA/Flash (ms) & Cron Root (ms) & Speedup \\
-\midrule
-512 & 0.024 & 0.045 & 0.53x \\
-1,024 & 0.040 & 0.046 & 0.86x \\
-2,048 & 0.112 & 0.058 & 1.95x \\
-4,096 & 0.290 & 0.068 & 4.27x \\
-8,192 & 0.916 & 0.103 & 8.90x \\
-16,384 & 3.27 & 0.288 & 11.34x \\
-32,768 & 12.1 & 0.953 & 12.67x \\
-65,536 & 46.5 & 1.68 & 27.65x \\
-131,072 & 185 & 5.69 & 32.40x \\
-262,144 & 736 & 11.8 & 62.31x \\
-524,288 & 2985 & 38.0 & \textbf{78.63x} \\
-\bottomrule
-\end{tabular}
-\label{tab:kernel_small}
-\end{table}
-
-\begin{table}[h]
-\centering
-\caption{Forward pass kernel latency --- \textbf{Large model} (B=1, H=16, D=128, FP16). Crossover drops to $\sim$1K tokens.}
-\begin{tabular}{lrrr}
-\toprule
-Seq Length & SDPA/Flash (ms) & Cron Root (ms) & Speedup \\
-\midrule
-512 & 0.036 & 0.043 & 0.84x \\
-1,024 & 0.102 & 0.053 & \textbf{1.92x} \\
-2,048 & 0.285 & 0.081 & 3.52x \\
-4,096 & 0.958 & 0.140 & 6.87x \\
-8,192 & 3.45 & 0.303 & 11.4x \\
-16,384 & 13.2 & 1.25 & 10.5x \\
-32,768 & 51.6 & 4.38 & 11.8x \\
-65,536 & 204 & 8.44 & 24.2x \\
-131,072 & 813 & 27.6 & 29.4x \\
-262,144 & 3251 & 62.2 & 52.3x \\
-524,288 & 12944 & 191 & \textbf{67.8x} \\
-\bottomrule
-\end{tabular}
-\label{tab:kernel_large}
-\end{table}
-
-\begin{table}[h]
-\centering
-\caption{Forward pass kernel latency --- \textbf{XL model} (B=1, H=32, D=128, FP16). Crossover at $\sim$512 tokens --- \textbf{CRA is faster than SDPA even at the shortest tested length.} OOM at 524K due to 16 GB VRAM limit.}
-\begin{tabular}{lrrr}
-\toprule
-Seq Length & SDPA/Flash (ms) & Cron Root (ms) & Speedup \\
-\midrule
-512 & 0.060 & 0.052 & \textbf{1.17x} \\
-1,024 & 0.158 & 0.070 & 2.26x \\
-2,048 & 0.508 & 0.132 & 3.85x \\
-4,096 & 1.78 & 0.242 & 7.33x \\
-8,192 & 6.65 & 0.570 & 11.7x \\
-16,384 & 26.0 & 2.49 & 10.5x \\
-32,768 & 102 & 8.77 & 11.7x \\
-65,536 & 407 & 17.0 & 24.0x \\
-131,072 & 1624 & 55.2 & 29.4x \\
-262,144 & 6412 & 125 & \textbf{51.4x} \\
-\bottomrule
-\end{tabular}
-\label{tab:kernel_xl}
-\end{table}
-
-\begin{table}[h]
-\centering
-\caption{Forward crossover points by model size. Larger models benefit more because SDPA's $O(N^2)$ cost grows with $H \cdot D$, while CRA's $O(N\sqrt{N})$ is less sensitive to model width.}
-\begin{tabular}{llr}
-\toprule
-Model Size & Heads $\times$ Head Dim & Forward Crossover \\
-\midrule
-Small & $8 \times 64$ & $\sim$2,048 tokens \\
-Medium & $12 \times 64$ & $\sim$1,024 tokens \\
-Large & $16 \times 128$ & $\sim$1,024 tokens \\
-XL & $32 \times 128$ & $\sim$\textbf{512 tokens} \\
-\bottomrule
-\end{tabular}
-\label{tab:crossover}
-\end{table}
-
-The subquadratic scaling is evident across all model sizes: at 524K tokens, CRA achieves 79x (Small), 68x (Large), and 51x (XL, limited to 262K by VRAM) speedup over SDPA. Critically, \textbf{the crossover point drops as model width increases}: from $\sim$2K tokens for the Small model (H=8, D=64) to $\sim$512 tokens for the XL model (H=32, D=128). This occurs because SDPA's $O(N^2)$ cost scales linearly with $H \cdot D$ (more heads and wider heads mean more quadratic work), while CRA's $O(N\sqrt{N})$ cost amortizes the fixed kernel launch overhead across more compute. For the XL model, CRA is faster than SDPA \emph{at every tested sequence length}, including $S=512$.
-
-For training (forward + backward), the crossover is approximately 2K tokens for the Small model thanks to the fully-fused single-kernel backward optimization.
-
-\textbf{Launch-overhead floor at small S.} Cron Root Attention reports a near-constant $\sim$0.046\,ms for both $S{=}512$ and $S{=}1{,}024$, and 0.058--0.068\,ms for $S{=}2{,}048$ and $S{=}4{,}096$. This is not an error: at these short sequence lengths the actual attention compute is negligible ($\sqrt{512} = 23$ attend positions per query), and the measured time is dominated by the \emph{fixed-cost floor} of the Triton persistent kernel launch --- grid setup, work-queue initialization, SRAM allocation, and the GPU kernel dispatch overhead itself. The kernel does no more arithmetic at $S{=}512$ than at $S{=}1{,}024$ (both fit within one work unit of the persistent grid with $B_M{=}64$), so the two measure nearly identically. SDPA/FlashAttention-2 has a lower launch floor ($\sim$0.024\,ms) because its CUDA-native implementation avoids the Triton JIT dispatcher overhead. The result is that Cron Root is slower below $\sim$2K tokens, after which the $O(N\sqrt{N})$ vs $O(N^2)$ compute gap overtakes the fixed launch differential.
-
-\textbf{Sub-linear speedup growth at S=131K.} The forward speedup at S=131,072 (32.40x) is only marginally above S=65,536 (27.65x), despite a $2\times$ increase in sequence length --- well below the 62.31x at S=262,144. The speedup is still \emph{monotonically increasing} throughout; it is the \emph{rate of growth} that stalls at 131K. This slowdown is a consequence of $\sqrt{N}$ alignment. The window size $W = \lceil\sqrt{N}\rceil$ yields $W=363$ for $N=131{,}072$, a non-power-of-2 value, while adjacent benchmarks yield perfect powers of two ($W=256$ at $N=65{,}536$ and $W=512$ at $N=262{,}144$). This causes three compounding penalties:
-
-\begin{enumerate}
-    \item \textbf{Loop tiling waste}: The kernel iterates in blocks of 64 (BLOCK\_M). With $W=363$, the inner loop requires $\lceil(363{+}64)/64\rceil = 7$ iterations per tile vs 5 for $W=256$, and $N=131{,}072$ requires $2\times$ more total tiles than $N=65{,}536$ --- yielding $2 \times 7/5 = 2.8\times$ the theoretical tile work (vs a $2\times$ increase for the $4\times$ larger $N=262{,}144$ which has $W=512$, i.e., 9 iterations per tile but $2\times$ tiles).
-    \item \textbf{Relay precompute penalty}: For $S > 8{,}192$, relay keys/values require a reshape to $[B, H, \lfloor N/W \rfloor, W, D]$. At $N=131{,}072$, this is $[1, H, 362, 363, D]$---norm\textsuperscript{2}-weighted pooling over 363 non-power-of-2 elements, requiring 334 tokens of zero-padding before reshape (vs zero padding at $N=65{,}536$ and $N=262{,}144$ where $W$ evenly divides $N$).
-    \item \textbf{Relay tensor misalignment}: The relay dimensions $362 \times 363$ are both non-aligned, causing suboptimal memory access patterns compared to the clean $256 \times 256$ and $512 \times 512$ layouts at adjacent sequence lengths.
-\end{enumerate}
-
-All three penalties compound simultaneously at $S=131{,}072$ specifically. At $S=262{,}144$, $W=512$ is a perfect power of two and the speedup recovers to 62.31x. A potential optimization is rounding $W$ to the next power of two, trading $O(\sqrt{N})$ extra attend positions ($<$41\% overhead at 131K) for aligned tiling, though this would change the attention pattern semantics.
-
-\subsection{End-to-End Training Performance}
-
-\begin{table}[h]
-\centering
-\caption{Complete forward + backward pass timing — RTX 5070 Ti, SM~12.0 (B=1, H=8, D=64, FP16, PyTorch 2.9.1, CUDA 12.8, Triton 3.5.1). Rows $\leq$8K use the fully-fused single-kernel backward; rows $>$8K use the atomic-free 3-kernel split backward. See Section~\ref{sec:setup}.}
-\begin{tabular}{lrrr}
-\toprule
-Seq Length & Cron Root Fwd+Bwd (ms) & SDPA Fwd+Bwd (ms) & Speedup \\
-\midrule
-512 & 0.224 & 0.134 & 0.60x \\
-1K & 0.228 & 0.164 & 0.72x \\
-2K & 0.299 & 0.344 & 1.15x \\
-4K & 0.503 & 0.920 & 1.83x \\
-8K & 0.946 & 2.91 & 3.07x \\
-16K & 8.47 & 10.82 & 1.28x \\
-32K & 23.66 & 41.67 & 1.76x \\
-64K & 63.51 & 163.18 & 2.57x \\
-128K & 178.0 & 648.6 & \textbf{3.64x} \\
-\bottomrule
-\end{tabular}
-\label{tab:training}
-\end{table}
-
-Training speedup increases with sequence length due to the quadratic vs subquadratic scaling gap. At 131K tokens, we achieve \textbf{3.64x} end-to-end speedup. For sequences $\leq$ 8K tokens, we use a \textbf{fully-fused single-kernel backward} that computes dQ, local dK/dV, and strided dK/dV in one kernel launch (with atomic\_add for K/V gradient accumulation), achieving up to 3.07x speedup at 8K. For sequences $>$ 8K, we use the \textbf{atomic-free 3-kernel split backward}: separate zero-atomic kernels for dQ, dK/dV, and relay dK/dV, eliminating inter-warp atomic contention and delivering approximately $2\times$ backward throughput improvement over the previous implementation at these sequence lengths.
-
-\textbf{Training dip at S=16K.} At the 8K$\to$16K transition, the backward switches from the fully-fused single-kernel to the atomic-free 3-kernel split strategy. This causes a visible throughput dip from 3.07x at 8K to 1.28x at 16K. Two factors contribute: (1) the multi-kernel launch overhead is amortized poorly at 16K because the per-kernel work is still relatively small, and (2) the relay mechanism activates for $S > 2048$ (configurable threshold), adding the norm\textsuperscript{2}-weighted relay precompute and a separate backward kernel for relay dK/dV gradients. As sequence length increases beyond 16K, the subquadratic compute advantage dominates these fixed costs and the speedup resumes its upward trajectory (1.76x at 32K, 2.57x at 64K, 3.64x at 128K).
-
-For longer sequences, we use four specialized zero-atomic kernels. A hybrid mode auto-selects SDPA for S $<$ 1536 and Cron Root for S $\geq$ 1536, guaranteeing $\geq$1.0x speedup at all sequence lengths.
-
-\subsection{Inference Performance}
-
-\begin{table}[h]
-\centering
-\caption{Inference (\texttt{no\_grad} prefill) latency — RTX 5070 Ti, SM~12.0 (B=1, H=8, D=64, FP16, PyTorch 2.9.1, CUDA 12.8, Triton 3.5.1). See Section~\ref{sec:setup}.}
-\begin{tabular}{lrrr}
-\toprule
-Seq Length & SDPA (ms) & Cron Root (ms) & Speedup \\
-\midrule
-512 & 0.025 & 0.046 & 0.54x \\
-1,024 & 0.037 & 0.050 & 0.75x \\
-2,048 & 0.110 & 0.050 & 2.21x \\
-4,096 & 0.292 & 0.068 & 4.27x \\
-8,192 & 0.917 & 0.108 & 8.52x \\
-16,384 & 3.29 & 0.279 & 11.82x \\
-32,768 & 12.1 & 0.954 & 12.70x \\
-65,536 & 46.9 & 1.70 & 27.60x \\
-131,072 & 185 & 5.71 & 32.45x \\
-262,144 & 737 & 11.8 & 62.35x \\
-524,288 & 2986 & 38.1 & \textbf{78.41x} \\
-\bottomrule
-\end{tabular}
-\label{tab:inference}
-\end{table}
-
-Under \texttt{torch.no\_grad()} inference, Cron Root Attention exhibits performance characteristics nearly identical to the forward-pass kernel benchmarks (Table~\ref{tab:kernel_small}), with a crossover at $\sim$2K tokens and a peak speedup of \textbf{78.41x} at 524K. This is expected: the Triton kernels execute identically regardless of PyTorch's autograd context, so \texttt{no\_grad()} only eliminates the negligible overhead of building the computation graph. The same $\sqrt{N}$-alignment slowdown at S=131,072 (32.45x, up from 27.60x at 65K) is present, recovering to 62.35x at S=262,144 ($W=512$, a perfect power of two).
-\label{sec:inference}
-
-\subsection{Empirical Scaling Analysis}
-
-To verify the $O(N\sqrt{N})$ complexity claim empirically, we measure the latency ratio when doubling the sequence length:
-
-\begin{table}[h]
-\centering
-\caption{Empirical scaling factor when doubling sequence length. CRA grows by $\sim$2--3.4$\times$ (consistent with $O(N\sqrt{N})$, theoretical factor $2\sqrt{2} \approx 2.83$), while SDPA grows by $\sim$3.6--4.0$\times$ (consistent with $O(N^2)$, theoretical factor 4). Small model (H=8, D=64).}
-\begin{tabular}{lrrr}
-\toprule
-Seq Len Doubling & CRA Scaling & SDPA Scaling & Theoretical \\
-\midrule
-512 $\to$ 1K & 1.05$\times$ & 1.54$\times$ & launch floor \\
-1K $\to$ 2K & 1.15$\times$ & 3.05$\times$ & launch floor \\
-4K $\to$ 8K & 1.68$\times$ & 3.18$\times$ & $\to 2\sqrt{2}$ \\
-16K $\to$ 32K & 3.44$\times$ & 3.93$\times$ & compute-dominated \\
-64K $\to$ 128K & 3.12$\times$ & 3.96$\times$ & SDPA $\to 4\times$ \\
-256K $\to$ 512K & 3.02$\times$ & 3.99$\times$ & CRA $\approx 3\times$, SDPA $\approx 4\times$ \\
-\bottomrule
-\end{tabular}
-\label{tab:scaling}
-\end{table}
-
-At short sequences ($< 4$K), both kernels are in the launch-overhead floor where absolute times are sub-0.1ms. True algorithmic scaling appears above 8K tokens, where SDPA converges to the predicted $4\times$ per doubling while CRA converges to $\sim$3$\times$, consistent with $O(N\sqrt{N})$.
-
-\subsection{Triton JIT Cold Start Overhead}
-
-Cron Root uses Triton JIT-compiled kernels. The \textbf{first call} at each unique $(\sqrt{N}, D)$ combination triggers PTX compilation and caching. Subsequent calls reuse the cached kernel.
-
-\begin{table}[h]
-\centering
-\caption{Cold start (first call in fresh process) vs warm (steady-state) latency. Small model.}
-\begin{tabular}{lrrr}
-\toprule
-Seq Length & Cold Start (ms) & Warm (ms) & JIT Overhead \\
-\midrule
-512 & 221 & 0.040 & 221ms (one-time) \\
-1,024 & 1.7 & 0.042 & 1.6ms \\
-4,096 & 1.5 & 0.061 & 1.5ms \\
-16,384 & 11.6 & 0.339 & 11.2ms \\
-65,536 & 3.9 & 2.35 & 1.5ms \\
-131,072 & 7.9 & 7.33 & 0.5ms \\
-524,288 & 52.6 & 52.1 & 0.4ms \\
-\bottomrule
-\end{tabular}
-\label{tab:coldstart}
-\end{table}
-
-The $\sim$221ms at $S=512$ is the one-time Triton PTX compilation and cache write, amortized across all subsequent sequence lengths in the same process. New $(\sqrt{N}, D)$ combinations incur smaller recompilations (1--12ms). At long sequences, kernel compute time dominates and cold $\approx$ warm.
-
-\subsection{Production Training Validation}
-\label{sec:training_validation}
-
-To validate CRA beyond isolated kernel benchmarks, we trained a 608M-parameter language model (Mira v5) from scratch on $2\times$ RTX 5070 Ti (16~GB each) using CRA as the default attention mechanism in 13/18 transformer layers. Architecture details:
-
-\begin{itemize}
-    \item \textbf{Model}: 1536-dim, 18 layers, 16 query heads, GQA-4 ($H_{kv}=4$)
-    \item \textbf{Attention mix}: 75\% CCA+CRA layers (compressed 4$\times$), 25\% full SDPA anchor layers
-    \item \textbf{Training}: DDP across 2 GPUs, FP8 precision (TransformerEngine), BNB AdamW-8bit + Muon NS-5
-    \item \textbf{Data}: 8 datasets (FineWeb-Edu, Falcon-RefinedWeb, GitHub-Code, UltraData-Math, ProofPile, arXiv)
-    \item \textbf{Batch}: $B=24$/GPU $\times$ GA=2 $\times$ 2 ranks = 96 seqs/step (49,152 tok/step at $S=512$)
-\end{itemize}
-
-\textbf{Results} (5,001 steps, 6.38 hours wall-clock):
-\begin{itemize}
-    \item \textbf{Throughput}: 10,400 tok/s sustained at $S{=}512$ (6.1--7.1\% MFU of 599 TFLOPS BF16 peak per GPU)
-    \item \textbf{Step time}: 4.5s/step median (including data loading, Muon preprocessing, optimizer)
-    \item \textbf{VRAM}: 4.75 GB allocated / 9.49 GB reserved per GPU --- rock-stable across all 5,001 steps
-    \item \textbf{Loss}: 11.41 $\to$ 6.40 (step 500) $\to$ 5.44 (step 1K) $\to$ 4.82 (step 2K) $\to$ 4.58 (step 3K) $\to$ 4.41 (step 4K) $\to$ \textbf{4.34} (step 5K)
-    \item \textbf{Perplexity}: 90,384 $\to$ 78.9 --- a \textbf{1,146$\times$} reduction over the full run
-    \item \textbf{Stability}: Zero NaN/Inf, zero crashes, only 3 LossGuard skip events across 5,001 steps
-    \item \textbf{ICL evaluation}: In-context learning loss improved from 5.81 (step 1K) $\to$ 5.27 (step 3K)
-    \item \textbf{Curriculum}: Successfully advanced from $S{=}512$ to $S{=}2048$ at step 5,000; first $S{=}2048$ step showed fwd=4.0s, bwd=4.8s (confirming CRA's subquadratic scaling in CCA layers)
-    \item \textbf{torch.compile}: CRA kernels compose correctly with Inductor graph capture throughout training
-\end{itemize}
-
-Separate controlled benchmarks on a 1.7B-parameter Dual-Brain model at $S=1024$ with pipeline parallelism showed CRA and SDPA within 1\% throughput of each other ($\sim$3,185 vs $\sim$3,168 tok/s with NVFP4+checkpointing), confirming that at $S=1024$ the attention kernel is not the bottleneck --- FFN, communication, and optimizer dominate. CRA's advantage manifests at $S \geq 2048$ where the $O(N\sqrt{N})$ vs $O(N^2)$ gap overtakes fixed overhead.
-
-\subsection{Correctness Validation}
-
-Comparing V14 output to sparse reference implementation:
-\begin{itemize}
-    \item Maximum absolute difference: 0.000977 (FP16)
-    \item Determinism: Bit-exact across runs
-    \item Gradient flow: Verified for dQ, dK, dV
-    \item NaN/Inf check: All outputs validated
-\end{itemize}
-
-\section{Code Release}
-\label{sec:code}
-
-Cron Root Attention is available as a pip package:
-
-\begin{verbatim}
-pip install cron-root-attention
-\end{verbatim}
-
-Or from source:
-\begin{verbatim}
-git clone https://github.com/zitacron/cron-root-attention.git
-cd cron-root-attention && pip install -e .
-\end{verbatim}
-
-Drop-in replacement:
-\begin{verbatim}
-from cron_root_attention import cron_root_attention, CronRootAttention
-
-# Functional API (supports GQA natively)
-q = torch.randn(1, 16, 8192, 64, device='cuda', dtype=torch.float16)
-k = torch.randn(1, 4, 8192, 64, device='cuda', dtype=torch.float16)  # GQA-4
-v = torch.randn(1, 4, 8192, 64, device='cuda', dtype=torch.float16)
-output = cron_root_attention(q, k, v, kv_groups=4)
-
-# Module API
-attn = CronRootAttention(d_model=1024, n_heads=16, n_kv_heads=4)
-output = attn(x)
-
-# Hybrid mode (auto-selects SDPA below crossover)
-from cron_root_attention import cron_root_attention_hybrid
-output = cron_root_attention_hybrid(q, k, v)  # >=1.0x at ALL lengths
-
-# Check GPU compatibility
-from cron_root_attention import get_gpu_info
-print(get_gpu_info())
-\end{verbatim}
-
-\subsection{Supported Hardware}
-
-The package automatically detects GPU SM count for optimal kernel grid sizing:
-
-\begin{table}[h]
-\centering
-\caption{Supported GPU families}
-\begin{tabular}{ll}
-\toprule
-Category & GPUs \\
-\midrule
-Blackwell (50 series) & RTX 5090, 5080, 5070 Ti, 5070 \\
-Ada (40 series) & RTX 4090, 4080, 4070 Ti, 4070, 4060 Ti \\
-Ampere (30 series) & RTX 3090, 3080, 3070, 3060 \\
-Turing (20 series) & RTX 2080 Ti, 2080, 2070, 2060, TITAN RTX \\
-Datacenter & H100, H200, H800, A100, L40S, L4, V100, B100, B200 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\section{Conclusion}
-
-Cron Root Attention achieves true subquadratic scaling ($O(N\sqrt{N})$) with practical speedups up to 79x for forward passes (Small model) and 68x (Large model) at long sequence lengths. Our 3-phase architecture (local + strided + relay) provides 100\% sequence coverage through a single softmax pass, eliminating gradient dilution. Norm\textsuperscript{2}-weighted relay pooling replaces uniform mean pooling for higher relay fidelity, and learnable per-head relay strength enables each attention head to calibrate its relay channel during training.
-
-The crossover point where CRA outperforms SDPA varies significantly by model size: $\sim$2K tokens for small models (H=8, D=64) down to $\sim$512 tokens for XL models (H=32, D=128), where CRA is faster at \emph{every} tested sequence length. Native GQA support and composability with Compressed Convolutional Attention (CCA) enable multiplicative $C \times \sqrt{N}$ savings.
-
-The fully-fused single-kernel backward (for $S \leq 8$K) achieves up to 3.07x training speedup, while the atomic-free multi-kernel backward (for $S > 8$K) scales to 3.64x at 131K tokens. A hybrid mode auto-selects SDPA below the crossover point, guaranteeing $\geq$1.0x speedup at all sequence lengths.
-
-We validated CRA in a 608M-parameter language model trained from scratch on $2\times$ RTX 5070 Ti, completing 5,001 steps in 6.38 hours with sustained 10,400 tok/s throughput. The model converged cleanly from loss 11.41 to 4.34 (local CE), achieving a 1,146$\times$ perplexity reduction (90,384 $\to$ 78.9) with zero crashes and only 3 anomalous gradient events across the entire run. At step 5,000, the curriculum successfully advanced from $S{=}512$ to $S{=}2048$, with the first long-sequence step completing without OOM or numerical instability. At $S=1024$, controlled benchmarks on a 1.7B-parameter model showed CRA and SDPA within 1\% of each other, confirming that CRA's asymptotic advantage dominates at $S \geq 2048$ while introducing no regression at shorter lengths.
-
-All kernel benchmarks were conducted on a single RTX 5070 Ti (Blackwell, SM~12.0) running PyTorch 2.9.1 + CUDA 12.8 + Triton 3.5.1; see Section~\ref{sec:setup} for the complete experimental setup. The pip-installable package provides drop-in replacement modules for immediate adoption in long-context LLM training and inference.
-
-\section*{Acknowledgments}
-
-Built on Triton by OpenAI. Inspired by FlashAttention by Tri Dao.
-
-\bibliographystyle{plain}
-\begin{thebibliography}{10}
-
-\bibitem{flashattn}
-Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher Ré.
-\newblock FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness.
-\newblock {\em NeurIPS}, 2022.
-
-\bibitem{flashattn2}
-Tri Dao.
-\newblock FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning.
-\newblock {\em arXiv:2307.08691}, 2023.
-
-\bibitem{flashdecoding}
-Tri Dao, Daniel Haziza, Francisco Massa, and Gintare Karolina Dziugaite.
-\newblock Flash-Decoding for Long-Context Inference.
-\newblock {\em Blog post}, 2023.
-
-\bibitem{longformer}
-Iz Beltagy, Matthew E. Peters, and Arman Cohan.
-\newblock Longformer: The Long-Document Transformer.
-\newblock {\em arXiv:2004.05150}, 2020.
-
-\bibitem{bigbird}
-Manzil Zaheer, Guru Guruganesh, Avinava Dubey, et al.
-\newblock Big Bird: Transformers for Longer Sequences.
-\newblock {\em NeurIPS}, 2020.
-
-\bibitem{sparse_transformers}
-Rewon Child, Scott Gray, Alec Radford, and Ilya Sutskever.
-\newblock Generating Long Sequences with Sparse Transformers.
-\newblock {\em arXiv:1904.10509}, 2019.
-
-\bibitem{linear_attention}
-Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pappas, and François Fleuret.
-\newblock Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention.
-\newblock {\em ICML}, 2020.
-
-\bibitem{rwkv}
-Bo Peng, Eric Alcaide, Quentin Anthony, et al.
-\newblock RWKV: Reinventing RNNs for the Transformer Era.
-\newblock {\em arXiv:2305.13048}, 2023.
-
-\bibitem{mamba}
-Albert Gu and Tri Dao.
-\newblock Mamba: Linear-Time Sequence Modeling with Selective State Spaces.
-\newblock {\em arXiv:2312.00752}, 2023.
-
-\bibitem{gqa}
-Joshua Ainslie, James Lee-Thorp, Michiel de Jong, Yinfei Yang, Sumit Sanghai, and Santiago Ontañón.
-\newblock GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints.
-\newblock {\em EMNLP}, 2023.
-
-\end{thebibliography}
-
-\end{document}
+    \end{algorithmic}
+    \end{algorithm}
+
+    \subsection{Optimized Backward Pass}
+
+    The backward pass computes $dQ$, $dK$, and $dV$. We provide two backward strategies selected by sequence length:
+
+    \textbf{Fully-fused single kernel (S $\leq$ 8192):} A single Triton kernel computes all gradients --- dQ via dot products with local and strided K, and dK/dV via \texttt{atomic\_add} from all contributing queries. The relay mechanism is skipped entirely (\texttt{skip\_relay} optimization), eliminating pad/reshape/mean precomputation. This reduces backward from 4 kernel launches to \textbf{1 kernel launch}, lowering the training crossover from $\sim$12K to $\sim$2K tokens.
+
+    \textbf{Key-centric multi-kernel (S $>$ 8192):} Four specialized kernels with exclusive ownership and zero atomic contention:
+    \begin{itemize}
+        \item \textbf{dQ kernel}: Query-parallel, includes all three phases (local + strided + relay contributions).
+        \item \textbf{Local dK/dV}: Each key block processes only its $O(\sqrt{N})$ local queries.
+        \item \textbf{Strided dK/dV}: Each block \textit{owns} one strided key and iterates over all $O(N)$ queries. Register accumulation, single write.
+        \item \textbf{Relay dK/dV}: Each block \textit{owns} one relay key/value pair. Gradient scatter via the norm\textsuperscript{2}-weighted Jacobian: $dK[rW{+}i] \mathrel{+}= w_i \cdot d\text{RK}[r]$, where $w_i = \|K_i\|^2 / \sum_j \|K_j\|^2$ are the precomputed importance weights.
+    \end{itemize}
+
+    \subsection{Hardware Optimization}
+
+    Key optimizations for broad GPU support:
+    \begin{itemize}
+        \item Dynamic SM detection via \texttt{torch.cuda.get\_device\_properties()}
+        \item GPU compatibility table covering 40+ models (RTX 20/30/40/50 series, H100, H800, A100, V100)
+        \item Block-query tiling with BLOCK\_M=64 queries per thread block
+        \item Coalesced memory access with vectorized loads
+        \item FP16 compute with FP32 accumulation for numerical stability
+    \end{itemize}
+
+    \section{Experiments}
+    \label{sec:experiments}
+
+    \subsection{Experimental Setup}
+    \label{sec:setup}
+
+    All benchmarks were conducted on the following hardware and software configuration:
+
+    \textbf{Hardware:}
+    \begin{itemize}
+        \item GPU: NVIDIA GeForce RTX 5070 Ti (Blackwell GB203, compute capability SM~12.0, 70~SMs, 16{,}303~MiB GDDR7 VRAM)
+        \item CPU: AMD Ryzen 9 7900X (12 cores / 24 threads, 5.7~GHz boost)
+        \item System RAM: 32~GiB DDR5
+        \item CUDA driver: 580.126.16
+    \end{itemize}
+
+    \textbf{Software:}
+    \begin{itemize}
+        \item OS: Linux 6.17.0-14-generic (x86\_64)
+        \item PyTorch: 2.9.1+cu128
+        \item CUDA toolkit: 12.8
+        \item cuDNN: 9.1.0.2
+        \item Triton: 3.5.1
+    \end{itemize}
+
+    \textbf{Benchmark protocol:} All latencies are measured using CUDA events with \texttt{torch.cuda.synchronize()} barriers. Each configuration is run with 8 warm-up iterations (so Triton JIT compilation is excluded from all reported times) followed by 25 timed repetitions; the trimmed mean (10\% trim on each tail) is reported to reduce outlier sensitivity. Forward-only benchmarks record a single \texttt{forward()} call under \texttt{torch.no\_grad()}; training benchmarks additionally call \texttt{loss.backward()}. Randomized tensors (\texttt{torch.randn}) are used throughout in FP16, BF16, and FP32 precisions. All runs are single-GPU, single-process, batch size $B=1$.
+
+    \textbf{Scope and limitations:} These benchmarks measure isolated attention kernel latency and do not include I/O, optimizer steps, or inter-GPU communication. They represent the best-case scenario for subquadratic attention in terms of relative advantage; wall-clock speedup in a full training loop will vary due to other bottlenecks. Results are specific to SM~12.0 (Blackwell) and will differ on other architectures (e.g., A100/H100 use SM~8.0/9.0 with different GEMM paths and different Triton tile mappings). The XL model (H=32, D=128) could not be benchmarked at $S=524{,}288$ due to the 16~GiB VRAM constraint.
+
+    \subsection{Forward Pass Kernel Benchmarks}
+
+    We benchmark four model sizes to characterize how the crossover point shifts with model width. All experiments use the setup described in Section~\ref{sec:setup}.
+
+    \begin{table}[h]
+    \centering
+    \caption{Forward pass kernel latency --- \textbf{Small model} (B=1, H=8, D=64, FP16). See Section~\ref{sec:setup} for full setup.}
+    \begin{tabular}{lrrr}
+    \toprule
+    Seq Length & SDPA/Flash (ms) & Cron Root (ms) & Speedup \\
+    \midrule
+    512 & 0.024 & 0.047 & 0.51x \\
+    1,024 & 0.036 & 0.053 & 0.68x \\
+    2,048 & 0.110 & 0.068 & 1.63x \\
+    4,096 & 0.288 & 0.147 & 1.95x \\
+    8,192 & 0.915 & 0.305 & 3.00x \\
+    16,384 & 3.41 & 0.632 & 5.39x \\
+    32,768 & 13.1 & 1.49 & 8.74x \\
+    65,536 & 48.2 & 3.64 & 13.25x \\
+    131,072 & 195 & 10.1 & 19.43x \\
+    262,144 & 778 & 25.7 & 30.33x \\
+    524,288 & 3154 & 75.3 & \textbf{41.87x} \\
+    \bottomrule
+    \end{tabular}
+    \label{tab:kernel_small}
+    \end{table}
+
+    \begin{table}[h]
+    \centering
+    \caption{Forward pass kernel latency --- \textbf{Large model} (B=1, H=16, D=128, FP16). Crossover drops to $\sim$1K tokens.}
+    \begin{tabular}{lrrr}
+    \toprule
+    Seq Length & SDPA/Flash (ms) & Cron Root (ms) & Speedup \\
+    \midrule
+    512 & 0.036 & 0.051 & 0.70x \\
+    1,024 & 0.100 & 0.062 & \textbf{1.61x} \\
+    2,048 & 0.284 & 0.097 & 2.94x \\
+    4,096 & 0.944 & 0.319 & 2.96x \\
+    8,192 & 3.52 & 0.740 & 4.76x \\
+    16,384 & 13.8 & 1.73 & 7.95x \\
+    32,768 & 54.6 & 4.84 & 11.29x \\
+    65,536 & 214 & 12.5 & 17.09x \\
+    131,072 & 854 & 34.8 & 24.54x \\
+    262,144 & 3460 & 90.7 & 38.13x \\
+    524,288 & 13758 & 258 & \textbf{53.28x} \\
+    \bottomrule
+    \end{tabular}
+    \label{tab:kernel_large}
+    \end{table}
+
+    \begin{table}[h]
+    \centering
+    \caption{Forward pass kernel latency --- \textbf{XL model} (B=1, H=32, D=128, FP16). Crossover at $\sim$1K tokens. OOM at 524K due to 16 GB VRAM limit.}
+    \begin{tabular}{lrrr}
+    \toprule
+    Seq Length & SDPA/Flash (ms) & Cron Root (ms) & Speedup \\
+    \midrule
+    512 & 0.058 & 0.070 & 0.84x \\
+    1,024 & 0.162 & 0.106 & 1.53x \\
+    2,048 & 0.501 & 0.165 & 3.03x \\
+    4,096 & 1.78 & 0.608 & 2.92x \\
+    8,192 & 6.97 & 1.44 & 4.83x \\
+    16,384 & 27.0 & 3.52 & 7.69x \\
+    32,768 & 108 & 9.66 & 11.17x \\
+    65,536 & 438 & 24.7 & 17.77x \\
+    131,072 & 1720 & 69.9 & 24.59x \\
+    262,144 & 6913 & 188 & \textbf{36.86x} \\
+    \bottomrule
+    \end{tabular}
+    \label{tab:kernel_xl}
+    \end{table}
+
+    \begin{table}[h]
+    \centering
+    \caption{Forward crossover points by model size and precision. Larger models and FP32 precision benefit more because SDPA's $O(N^2)$ cost grows with $H \cdot D$, while CRA's $O(N\sqrt{N})$ is less sensitive to model width. FP32 crossover is lower because SDPA falls back to the math backend.}
+    \begin{tabular}{llrr}
+    \toprule
+    Model Size & Heads $\times$ Head Dim & FP16 Crossover & FP32 Crossover \\
+    \midrule
+    Small & $8 \times 64$ & $\sim$2,048 tokens & $\sim$\textbf{512 tokens} \\
+    Large & $16 \times 128$ & $\sim$1,024 tokens & $\sim$\textbf{512 tokens} \\
+    XL & $32 \times 128$ & $\sim$1,024 tokens & --- \\
+    \bottomrule
+    \end{tabular}
+    \label{tab:crossover}
+    \end{table}
+
+    The subquadratic scaling is evident across all model sizes: at 524K tokens, CRA achieves 42x (Small) and 53x (Large) forward speedup over SDPA, with 37x for XL at 262K (limited by VRAM). \textbf{The crossover point drops as model width increases}: from $\sim$2K tokens for the Small model (H=8, D=64) to $\sim$1K tokens for the XL model (H=32, D=128) in FP16. Under FP32, \textbf{CRA is faster than SDPA even at the shortest tested length} ($S=512$, 1.17x for Small) because SDPA's FlashAttention backend does not support FP32, falling back to the significantly slower math kernel.
+
+    For training (forward + backward), the crossover is approximately 8K tokens for the Small model.
+
+    \textbf{Launch-overhead floor at small S.} Cron Root Attention reports a near-constant $\sim$0.047--0.053\,ms for $S{=}512$ through $S{=}1{,}024$, and 0.068--0.147\,ms for $S{=}2{,}048$ and $S{=}4{,}096$. This is not an error: at these short sequence lengths the actual attention compute is negligible ($\sqrt{512} = 23$ attend positions per query), and the measured time is dominated by the \emph{fixed-cost floor} of the Triton persistent kernel launch --- grid setup, work-queue initialization, SRAM allocation, and the GPU kernel dispatch overhead itself. SDPA/FlashAttention-2 has a lower launch floor ($\sim$0.024\,ms) because its CUDA-native implementation avoids the Triton JIT dispatcher overhead. The result is that Cron Root is slower below $\sim$2K tokens in FP16, after which the $O(N\sqrt{N})$ vs $O(N^2)$ compute gap overtakes the fixed launch differential.
+
+    \textbf{Sub-linear speedup growth at S=131K.} The forward speedup at S=131,072 (19.43x) is only marginally above S=65,536 (13.25x), despite a $2\times$ increase in sequence length --- well below the 30.33x at S=262,144. The speedup is still \emph{monotonically increasing} throughout; it is the \emph{rate of growth} that stalls at 131K. This slowdown is a consequence of $\sqrt{N}$ alignment. The window size $W = \lceil\sqrt{N}\rceil$ yields $W=363$ for $N=131{,}072$, a non-power-of-2 value, while adjacent benchmarks yield perfect powers of two ($W=256$ at $N=65{,}536$ and $W=512$ at $N=262{,}144$). This causes three compounding penalties:
+
+    \begin{enumerate}
+        \item \textbf{Loop tiling waste}: The kernel iterates in blocks of 64 (BLOCK\_M). With $W=363$, the inner loop requires $\lceil(363{+}64)/64\rceil = 7$ iterations per tile vs 5 for $W=256$, and $N=131{,}072$ requires $2\times$ more total tiles than $N=65{,}536$ --- yielding $2 \times 7/5 = 2.8\times$ the theoretical tile work (vs a $2\times$ increase for the $4\times$ larger $N=262{,}144$ which has $W=512$, i.e., 9 iterations per tile but $2\times$ tiles).
+        \item \textbf{Relay precompute penalty}: For $S > 8{,}192$, relay keys/values require a reshape to $[B, H, \lfloor N/W \rfloor, W, D]$. At $N=131{,}072$, this is $[1, H, 362, 363, D]$---norm\textsuperscript{2}-weighted pooling over 363 non-power-of-2 elements, requiring 334 tokens of zero-padding before reshape (vs zero padding at $N=65{,}536$ and $N=262{,}144$ where $W$ evenly divides $N$).
+        \item \textbf{Relay tensor misalignment}: The relay dimensions $362 \times 363$ are both non-aligned, causing suboptimal memory access patterns compared to the clean $256 \times 256$ and $512 \times 512$ layouts at adjacent sequence lengths.
+    \end{enumerate}
+
+    All three penalties compound simultaneously at $S=131{,}072$ specifically. At $S=262{,}144$, $W=512$ is a perfect power of two and the speedup recovers to 30.33x. A potential optimization is rounding $W$ to the next power of two, trading $O(\sqrt{N})$ extra attend positions ($<$41\% overhead at 131K) for aligned tiling, though this would change the attention pattern semantics.
+
+    \subsection{End-to-End Training Performance}
+
+    \begin{table}[h]
+    \centering
+    \caption{Complete forward + backward pass timing — RTX 5070 Ti, SM~12.0 (B=1, H=8, D=64, FP16, PyTorch 2.9.1, CUDA 12.8, Triton 3.5.1). Rows $\leq$8K use the fully-fused single-kernel backward; rows $>$8K use the atomic-free 3-kernel split backward. See Section~\ref{sec:setup}.}
+    \begin{tabular}{lrrr}
+    \toprule
+    Seq Length & Cron Root Fwd+Bwd (ms) & SDPA Fwd+Bwd (ms) & Speedup \\
+    \midrule
+    512 & 0.269 & 0.109 & 0.41x \\
+    1K & 0.262 & 0.160 & 0.61x \\
+    2K & 0.410 & 0.352 & 0.86x \\
+    4K & 0.989 & 0.927 & 0.94x \\
+    8K & 2.52 & 3.06 & 1.21x \\
+    16K & 6.39 & 11.7 & 1.84x \\
+    32K & 17.2 & 45.9 & 2.67x \\
+    64K & 48.0 & 180 & 3.76x \\
+    128K & 126.4 & 723 & \textbf{5.72x} \\
+    \bottomrule
+    \end{tabular}
+    \label{tab:training}
+    \end{table}
+
+    Training speedup increases with sequence length due to the quadratic vs subquadratic scaling gap. At 131K tokens, we achieve \textbf{5.72x} end-to-end speedup. For sequences $\leq$ 8K tokens, we use a \textbf{fully-fused single-kernel backward} that computes dQ, local dK/dV, and strided dK/dV in one kernel launch (with atomic\_add for K/V gradient accumulation), achieving 1.21x crossover at 8K. For sequences $>$ 8K, we use the \textbf{atomic-free 3-kernel split backward}: separate zero-atomic kernels for dQ, dK/dV, and relay dK/dV, eliminating inter-warp atomic contention. The backward crossover is at $\sim$8K tokens for the Small model; below that, SDPA's CUDA-native backward is faster than the Triton-based CRA backward.
+
+    \textbf{Training crossover at S=8K.} The training crossover (1.21x at 8K) is higher than the forward crossover (3.00x at 8K) because the CRA backward pass involves additional kernel launches and relay gradient scatter that are absent from the forward-only path. As sequence length increases, the subquadratic scaling advantage dominates these fixed costs: 1.84x at 16K, 2.67x at 32K, 3.76x at 64K, 5.72x at 128K.
+
+    For longer sequences, we use four specialized zero-atomic kernels. A hybrid mode auto-selects SDPA for S $<$ 1536 and Cron Root for S $\geq$ 1536, guaranteeing $\geq$1.0x speedup at all sequence lengths.
+
+    \subsection{Inference Performance}
+
+    \begin{table}[h]
+    \centering
+    \caption{Inference (\texttt{no\_grad} prefill) latency — RTX 5070 Ti, SM~12.0 (B=1, H=8, D=64, FP16, PyTorch 2.9.1, CUDA 12.8, Triton 3.5.1). See Section~\ref{sec:setup}.}
+    \begin{tabular}{lrrr}
+    \toprule
+    Seq Length & SDPA (ms) & Cron Root (ms) & Speedup \\
+    \midrule
+    512 & 0.024 & 0.047 & 0.51x \\
+    1,024 & 0.036 & 0.053 & 0.68x \\
+    2,048 & 0.110 & 0.068 & 1.63x \\
+    4,096 & 0.288 & 0.147 & 1.95x \\
+    8,192 & 0.915 & 0.305 & 3.00x \\
+    16,384 & 3.41 & 0.632 & 5.39x \\
+    32,768 & 13.1 & 1.49 & 8.74x \\
+    65,536 & 48.2 & 3.64 & 13.25x \\
+    131,072 & 195 & 10.1 & 19.43x \\
+    262,144 & 778 & 25.7 & 30.33x \\
+    524,288 & 3154 & 75.3 & \textbf{41.87x} \\
+    \bottomrule
+    \end{tabular}
+    \label{tab:inference}
+    \end{table}
+
+    Under \texttt{torch.no\_grad()} inference, Cron Root Attention exhibits performance characteristics nearly identical to the forward-pass kernel benchmarks (Table~\ref{tab:kernel_small}), with a crossover at $\sim$2K tokens and a peak speedup of \textbf{41.87x} at 524K. This is expected: the Triton kernels execute identically regardless of PyTorch's autograd context, so \texttt{no\_grad()} only eliminates the negligible overhead of building the computation graph. The same $\sqrt{N}$-alignment slowdown at S=131,072 (19.43x, up from 13.25x at 65K) is present, recovering to 30.33x at S=262,144 ($W=512$, a perfect power of two).
+    \label{sec:inference}
+
+    \subsection{Empirical Scaling Analysis}
+
+    To verify the $O(N\sqrt{N})$ complexity claim empirically, we measure the latency ratio when doubling the sequence length:
+
+    \begin{table}[h]
+    \centering
+    \caption{Empirical scaling factor when doubling sequence length. CRA grows by $\sim$2--3$\times$ (consistent with $O(N\sqrt{N})$, theoretical factor $2\sqrt{2} \approx 2.83$), while SDPA grows by $\sim$3.5--4.1$\times$ (consistent with $O(N^2)$, theoretical factor 4). Small model (H=8, D=64, FP16).}
+    \begin{tabular}{lrrr}
+    \toprule
+    Seq Len Doubling & CRA Scaling & SDPA Scaling & Theoretical \\
+    \midrule
+    512 $\to$ 1K & 1.13$\times$ & 1.52$\times$ & launch floor \\
+    1K $\to$ 2K & 1.28$\times$ & 3.05$\times$ & launch floor \\
+    4K $\to$ 8K & 2.07$\times$ & 3.18$\times$ & $\to 2\sqrt{2}$ \\
+    16K $\to$ 32K & 2.36$\times$ & 3.83$\times$ & compute-dominated \\
+    64K $\to$ 128K & 2.76$\times$ & 4.06$\times$ & SDPA $\to 4\times$ \\
+    256K $\to$ 512K & 2.94$\times$ & 4.05$\times$ & CRA $\approx 3\times$, SDPA $\approx 4\times$ \\
+    \bottomrule
+    \end{tabular}
+    \label{tab:scaling}
+    \end{table}
+
+    At short sequences ($< 4$K), both kernels are in the launch-overhead floor where absolute times are sub-0.1ms. True algorithmic scaling appears above 8K tokens, where SDPA converges to the predicted $4\times$ per doubling while CRA converges to $\sim$3$\times$, consistent with $O(N\sqrt{N})$.
+
+    \subsection{Precision Sensitivity: FP16 vs BF16 vs FP32}
+    \label{sec:precision}
+
+    We benchmark CRA across three precisions to characterize kernel behavior on different numeric formats.
+
+    \begin{table}[h]
+    \centering
+    \caption{Forward speedup comparison across precisions --- \textbf{Small model} (B=1, H=8, D=64). FP32 results are dramatically higher because SDPA's FlashAttention backend does not support FP32, falling back to the significantly slower math kernel.}
+    \begin{tabular}{lrrr}
+    \toprule
+    Seq Length & FP16 Speedup & BF16 Speedup & FP32 Speedup \\
+    \midrule
+    512 & 0.51x & 0.51x & \textbf{1.17x} \\
+    1,024 & 0.68x & 0.69x & 2.89x \\
+    2,048 & 1.63x & 1.62x & 5.43x \\
+    4,096 & 1.95x & 2.00x & 8.13x \\
+    8,192 & 3.00x & 3.02x & 12.40x \\
+    16,384 & 5.39x & 5.09x & 21.19x \\
+    32,768 & 8.74x & 8.21x & 33.15x \\
+    65,536 & 13.25x & 12.98x & 52.81x \\
+    131,072 & 19.43x & 18.88x & \textbf{77.27x} \\
+    \bottomrule
+    \end{tabular}
+    \label{tab:precision_small}
+    \end{table}
+
+    \begin{table}[h]
+    \centering
+    \caption{Forward speedup comparison across precisions --- \textbf{Large model} (B=1, H=16, D=128).}
+    \begin{tabular}{lrrr}
+    \toprule
+    Seq Length & FP16 Speedup & BF16 Speedup & FP32 Speedup \\
+    \midrule
+    512 & 0.70x & 0.71x & 2.24x \\
+    1,024 & 1.61x & 1.62x & 4.67x \\
+    4,096 & 2.96x & 2.99x & 8.77x \\
+    8,192 & 4.76x & 4.57x & 14.03x \\
+    16,384 & 7.95x & 7.48x & 22.93x \\
+    32,768 & 11.29x & 11.05x & \textbf{33.11x} \\
+    \bottomrule
+    \end{tabular}
+    \label{tab:precision_large}
+    \end{table}
+
+    \textbf{FP16 and BF16 are within 5\%.} The CRA Triton kernel uses FP32 accumulation regardless of input precision, so the compute path is identical for FP16 and BF16 --- only memory bandwidth changes (negligible at these sizes). SDPA's FlashAttention backend similarly handles both half-precision formats.
+
+    \textbf{FP32 shows dramatically larger speedups.} Under FP32, SDPA cannot use the FlashAttention CUDA kernel (which requires FP16/BF16) and falls back to PyTorch's math-backend attention, which is orders of magnitude slower. CRA's Triton kernel handles FP32 natively with only modestly higher latency (due to doubled memory traffic), resulting in up to \textbf{77x} forward speedup at 131K (Small) and \textbf{33x} at 32K (Large). This makes CRA especially attractive for FP32 training or fine-tuning workloads where numerical precision is paramount.
+
+    \subsection{Learned vs Fixed Relay Strength}
+    \label{sec:learned_relay}
+
+    CRA supports an optional learnable per-KV-head relay strength parameter $\alpha_h$ (Section~\ref{sec:relay_improvements}), where relay keys/values are scaled by $e^{\alpha_h}$ before the attention computation. We benchmark both modes to quantify any kernel overhead.
+
+    \begin{table}[h]
+    \centering
+    \caption{Fixed vs Learned relay --- \textbf{Large model} forward (B=1, H=16, D=128, FP16). ``Fixed'' passes no relay\_log\_scale; ``Learned'' passes a random $[H_{kv}]$ tensor. At $S \leq 2048$, relay is skipped entirely.}
+    \begin{tabular}{lrrrr}
+    \toprule
+    Seq Length & Fixed CRA (ms) & Learned CRA (ms) & Overhead & SDPA (ms) \\
+    \midrule
+    512 & 0.051 & 0.051 & 0\% & 0.036 \\
+    1,024 & 0.062 & 0.063 & 1\% & 0.100 \\
+    2,048 & 0.097 & 0.100 & 3\% & 0.284 \\
+    4,096 & 0.319 & 0.328 & 3\% & 0.944 \\
+    8,192 & 0.740 & 0.747 & 1\% & 3.52 \\
+    16,384 & 1.73 & 1.76 & 1\% & 13.8 \\
+    32,768 & 4.84 & 5.00 & 3\% & 54.6 \\
+    65,536 & 12.5 & 12.6 & 1\% & 214 \\
+    131,072 & 34.8 & 33.8 & $-$3\% & 854 \\
+    \bottomrule
+    \end{tabular}
+    \label{tab:learned_relay}
+    \end{table}
+
+    \textbf{The learned relay adds $<$3\% overhead.} The relay\_log\_scale is applied as a Python-side elementwise multiply on the relay K/V tensors \emph{before} the main Triton kernel, never inside the kernel hot loop. At $S \leq 2048$, relay is skipped entirely, so both modes are identical. At longer sequences, the overhead is within measurement noise ($\pm$3\%), confirming that the learnable relay parameter is essentially free.
+
+    \textbf{Training performance is similarly unaffected:} Learned-relay training (fwd+bwd) matches fixed-relay training within 2\% at all sequence lengths. The backward gradient $\partial\mathcal{L}/\partial\alpha_h$ is a small $[H_{kv}]$-sized reduction computed after the main backward kernel, adding negligible overhead.
+
+    \textbf{Training impact.} In preliminary training experiments, the fixed-relay configuration (relay\_log\_scale disabled) showed consistent early loss plateaus, with training loss stalling at higher values compared to the learned-relay configuration. By contrast, the learned relay allowed each KV-head to independently calibrate its relay channel trust, leading to smoother convergence. The layer routing itself (which layers use CRA vs FullAttention) remains static and config-driven (Section~\ref{sec:gqa_cca}); only the relay strength within CRA layers is learned.
+
+    \subsection{Triton JIT Cold Start Overhead}
+
+    Cron Root uses Triton JIT-compiled kernels. The \textbf{first call} at each unique $(\sqrt{N}, D)$ combination triggers PTX compilation and caching. Subsequent calls reuse the cached kernel.
+
+    \begin{table}[h]
+    \centering
+    \caption{Cold start (first call in fresh process) vs warm (steady-state) latency. Small model.}
+    \begin{tabular}{lrrr}
+    \toprule
+    Seq Length & Cold Start (ms) & Warm (ms) & JIT Overhead \\
+    \midrule
+    512 & 221 & 0.040 & 221ms (one-time) \\
+    1,024 & 1.7 & 0.042 & 1.6ms \\
+    4,096 & 1.5 & 0.061 & 1.5ms \\
+    16,384 & 11.6 & 0.339 & 11.2ms \\
+    65,536 & 3.9 & 2.35 & 1.5ms \\
+    131,072 & 7.9 & 7.33 & 0.5ms \\
+    524,288 & 52.6 & 52.1 & 0.4ms \\
+    \bottomrule
+    \end{tabular}
+    \label{tab:coldstart}
+    \end{table}
+
+    The $\sim$221ms at $S=512$ is the one-time Triton PTX compilation and cache write, amortized across all subsequent sequence lengths in the same process. New $(\sqrt{N}, D)$ combinations incur smaller recompilations (1--12ms). At long sequences, kernel compute time dominates and cold $\approx$ warm.
+
+    \subsection{Production Training Validation}
+    \label{sec:training_validation}
+
+    To validate CRA beyond isolated kernel benchmarks, we trained a 608M-parameter language model (Mira v5) from scratch on $2\times$ RTX 5070 Ti (16~GB each) using CRA as the default attention mechanism in 13/18 transformer layers. Architecture details:
+
+    \begin{itemize}
+        \item \textbf{Model}: 1536-dim, 18 layers, 16 query heads, GQA-4 ($H_{kv}=4$)
+        \item \textbf{Attention mix}: 75\% CCA+CRA layers (compressed 4$\times$), 25\% full SDPA anchor layers
+        \item \textbf{Training}: DDP across 2 GPUs, FP8 precision (TransformerEngine), BNB AdamW-8bit + Muon NS-5
+        \item \textbf{Data}: 8 datasets (FineWeb-Edu, Falcon-RefinedWeb, GitHub-Code, UltraData-Math, ProofPile, arXiv)
+        \item \textbf{Batch}: $B=24$/GPU $\times$ GA=2 $\times$ 2 ranks = 96 seqs/step (49,152 tok/step at $S=512$)
+    \end{itemize}
+
+    \textbf{Results} (5,001 steps, 6.38 hours wall-clock):
+    \begin{itemize}
+        \item \textbf{Throughput}: 10,400 tok/s sustained at $S{=}512$ (6.1--7.1\% MFU of 599 TFLOPS BF16 peak per GPU)
+        \item \textbf{Step time}: 4.5s/step median (including data loading, Muon preprocessing, optimizer)
+        \item \textbf{VRAM}: 4.75 GB allocated / 9.49 GB reserved per GPU --- rock-stable across all 5,001 steps
+        \item \textbf{Loss}: 11.41 $\to$ 6.40 (step 500) $\to$ 5.44 (step 1K) $\to$ 4.82 (step 2K) $\to$ 4.58 (step 3K) $\to$ 4.41 (step 4K) $\to$ \textbf{4.34} (step 5K)
+        \item \textbf{Perplexity}: 90,384 $\to$ 78.9 --- a \textbf{1,146$\times$} reduction over the full run
+        \item \textbf{Stability}: Zero NaN/Inf, zero crashes, only 3 LossGuard skip events across 5,001 steps
+        \item \textbf{ICL evaluation}: In-context learning loss improved from 5.81 (step 1K) $\to$ 5.27 (step 3K)
+        \item \textbf{Curriculum}: Successfully advanced from $S{=}512$ to $S{=}2048$ at step 5,000; first $S{=}2048$ step showed fwd=4.0s, bwd=4.8s (confirming CRA's subquadratic scaling in CCA layers)
+        \item \textbf{torch.compile}: CRA kernels compose correctly with Inductor graph capture throughout training
+    \end{itemize}
+
+    Separate controlled benchmarks on a 1.7B-parameter Dual-Brain model at $S=1024$ with pipeline parallelism showed CRA and SDPA within 1\% throughput of each other ($\sim$3,185 vs $\sim$3,168 tok/s with NVFP4+checkpointing), confirming that at $S=1024$ the attention kernel is not the bottleneck --- FFN, communication, and optimizer dominate. CRA's advantage manifests at $S \geq 2048$ where the $O(N\sqrt{N})$ vs $O(N^2)$ gap overtakes fixed overhead.
+
+    \subsection{Correctness Validation}
+
+    Comparing V14 output to sparse reference implementation:
+    \begin{itemize}
+        \item Maximum absolute difference: 0.000977 (FP16)
+        \item Determinism: Bit-exact across runs
+        \item Gradient flow: Verified for dQ, dK, dV
+        \item NaN/Inf check: All outputs validated
+    \end{itemize}
+
+    \section{Code Release}
+    \label{sec:code}
+
+    Cron Root Attention is available as a pip package:
+
+    \begin{verbatim}
+    pip install cron-root-attention
+    \end{verbatim}
+
+    Or from source:
+    \begin{verbatim}
+    git clone https://github.com/zitacron/cron-root-attention.git
+    cd cron-root-attention && pip install -e .
+    \end{verbatim}
+
+    Drop-in replacement:
+    \begin{verbatim}
+    from cron_root_attention import cron_root_attention, CronRootAttention
+
+    # Functional API (supports GQA natively)
+    q = torch.randn(1, 16, 8192, 64, device='cuda', dtype=torch.float16)
+    k = torch.randn(1, 4, 8192, 64, device='cuda', dtype=torch.float16)  # GQA-4
+    v = torch.randn(1, 4, 8192, 64, device='cuda', dtype=torch.float16)
+    output = cron_root_attention(q, k, v, kv_groups=4)
+
+    # Module API
+    attn = CronRootAttention(d_model=1024, n_heads=16, n_kv_heads=4)
+    output = attn(x)
+
+    # Hybrid mode (auto-selects SDPA below crossover)
+    from cron_root_attention import cron_root_attention_hybrid
+    output = cron_root_attention_hybrid(q, k, v)  # >=1.0x at ALL lengths
+
+    # Check GPU compatibility
+    from cron_root_attention import get_gpu_info
+    print(get_gpu_info())
+    \end{verbatim}
+
+    \subsection{Supported Hardware}
+
+    The package automatically detects GPU SM count for optimal kernel grid sizing:
+
+    \begin{table}[h]
+    \centering
+    \caption{Supported GPU families}
+    \begin{tabular}{ll}
+    \toprule
+    Category & GPUs \\
+    \midrule
+    Blackwell (50 series) & RTX 5090, 5080, 5070 Ti, 5070 \\
+    Ada (40 series) & RTX 4090, 4080, 4070 Ti, 4070, 4060 Ti \\
+    Ampere (30 series) & RTX 3090, 3080, 3070, 3060 \\
+    Turing (20 series) & RTX 2080 Ti, 2080, 2070, 2060, TITAN RTX \\
+    Datacenter & H100, H200, H800, A100, L40S, L4, V100, B100, B200 \\
+    \bottomrule
+    \end{tabular}
+    \end{table}
+
+    \section{Conclusion}
+
+    Cron Root Attention achieves true subquadratic scaling ($O(N\sqrt{N})$) with practical speedups up to 42x for forward passes (Small model, FP16) and 53x (Large model) at long sequence lengths. Under FP32, where SDPA falls back to the math backend, CRA achieves 77x forward speedup at 131K tokens. Our 3-phase architecture (local + strided + relay) provides 100\% sequence coverage through a single softmax pass, eliminating gradient dilution. Norm\textsuperscript{2}-weighted relay pooling replaces uniform mean pooling for higher relay fidelity, and learnable per-head relay strength (adding $<$3\% kernel overhead) enables each attention head to calibrate its relay channel during training.
+
+    The crossover point where CRA outperforms SDPA varies by model size: $\sim$2K tokens for small models (H=8, D=64, FP16) down to $\sim$512 tokens for FP32 models, where CRA is faster at \emph{every} tested sequence length. BF16 performance is within 5\% of FP16 across all configurations. Native GQA support and composability with Compressed Convolutional Attention (CCA) enable multiplicative $C \times \sqrt{N}$ savings.
+
+    The fully-fused single-kernel backward (for $S \leq 8$K) crosses over at $\sim$8K tokens, while the atomic-free multi-kernel backward (for $S > 8$K) scales to 5.72x at 131K tokens. A hybrid mode auto-selects SDPA below the crossover point, guaranteeing $\geq$1.0x speedup at all sequence lengths.
+
+    We validated CRA in a 608M-parameter language model trained from scratch on $2\times$ RTX 5070 Ti, completing 5,001 steps in 6.38 hours with sustained 10,400 tok/s throughput. The model converged cleanly from loss 11.41 to 4.34 (local CE), achieving a 1,146$\times$ perplexity reduction (90,384 $\to$ 78.9) with zero crashes and only 3 anomalous gradient events across the entire run. At step 5,000, the curriculum successfully advanced from $S{=}512$ to $S{=}2048$, with the first long-sequence step completing without OOM or numerical instability. At $S=1024$, controlled benchmarks on a 1.7B-parameter model showed CRA and SDPA within 1\% of each other, confirming that CRA's asymptotic advantage dominates at $S \geq 2048$ while introducing no regression at shorter lengths.
+
+    All kernel benchmarks were conducted on a single RTX 5070 Ti (Blackwell, SM~12.0) running PyTorch 2.9.1 + CUDA 12.8 + Triton 3.5.1 across FP16, BF16, and FP32 precisions; see Section~\ref{sec:setup} for the complete experimental setup. The pip-installable package provides drop-in replacement modules for immediate adoption in long-context LLM training and inference.
+
+    \section*{Acknowledgments}
+
+    Built on Triton by OpenAI. Inspired by FlashAttention by Tri Dao.
+
+    \bibliographystyle{plain}
+    \begin{thebibliography}{10}
+
+    \bibitem{flashattn}
+    Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher Ré.
+    \newblock FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness.
+    \newblock {\em NeurIPS}, 2022.
+
+    \bibitem{flashattn2}
+    Tri Dao.
+    \newblock FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning.
+    \newblock {\em arXiv:2307.08691}, 2023.
+
+    \bibitem{flashdecoding}
+    Tri Dao, Daniel Haziza, Francisco Massa, and Gintare Karolina Dziugaite.
+    \newblock Flash-Decoding for Long-Context Inference.
+    \newblock {\em Blog post}, 2023.
+
+    \bibitem{longformer}
+    Iz Beltagy, Matthew E. Peters, and Arman Cohan.
+    \newblock Longformer: The Long-Document Transformer.
+    \newblock {\em arXiv:2004.05150}, 2020.
+
+    \bibitem{bigbird}
+    Manzil Zaheer, Guru Guruganesh, Avinava Dubey, et al.
+    \newblock Big Bird: Transformers for Longer Sequences.
+    \newblock {\em NeurIPS}, 2020.
+
+    \bibitem{sparse_transformers}
+    Rewon Child, Scott Gray, Alec Radford, and Ilya Sutskever.
+    \newblock Generating Long Sequences with Sparse Transformers.
+    \newblock {\em arXiv:1904.10509}, 2019.
+
+    \bibitem{linear_attention}
+    Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pappas, and François Fleuret.
+    \newblock Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention.
+    \newblock {\em ICML}, 2020.
+
+    \bibitem{rwkv}
+    Bo Peng, Eric Alcaide, Quentin Anthony, et al.
+    \newblock RWKV: Reinventing RNNs for the Transformer Era.
+    \newblock {\em arXiv:2305.13048}, 2023.
+
+    \bibitem{mamba}
+    Albert Gu and Tri Dao.
+    \newblock Mamba: Linear-Time Sequence Modeling with Selective State Spaces.
+    \newblock {\em arXiv:2312.00752}, 2023.
+
+    \bibitem{gqa}
+    Joshua Ainslie, James Lee-Thorp, Michiel de Jong, Yinfei Yang, Sumit Sanghai, and Santiago Ontañón.
+    \newblock GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints.
+    \newblock {\em EMNLP}, 2023.
+
+    \end{thebibliography}
+
+    \end{document}

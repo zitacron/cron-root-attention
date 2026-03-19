@@ -45,6 +45,9 @@ import triton
 import triton.language as tl
 from typing import Optional, Tuple
 from functools import lru_cache
+import json
+import os
+import threading
 
 # =============================================================================
 # HARDWARE DETECTION & GPU COMPATIBILITY
@@ -201,28 +204,348 @@ def _get_num_sms():
 # =============================================================================
 
 def _get_blackwell_kernel_config():
-    """Return (num_warps, num_stages_fwd, num_stages_bwd) for the current GPU."""
+    """Return (num_warps, num_stages_fwd, num_stages_bwd) for the current GPU.
+
+    These are conservative defaults that perform well across all tested GPUs.
+    The inline auto-tuner (below) refines them on first call if a better config
+    exists for the specific (GPU, H, D) combination.
+    """
     if not torch.cuda.is_available():
         return 4, 2, 1
-    sm_major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
-    if sm_major >= 12:   # Blackwell (SM 12.0: RTX 50xx, B100/B200)
-        # num_stages_fwd=4 requires 119 KB shared memory (above the 101 KB
-        # default), needing cudaFuncSetAttribute(MaxDynamicSharedMemorySize).
-        # num_stages_fwd=3 requires ~92 KB — fits within the 101 KB default.
-        # Provides ~30% more prefetch overlap than 2-stage (tripled data-loading
-        # pipeline depth) without the cudaFuncSetAttribute requirement.
-        # TODO: call cudaFuncSetAttribute(MaxDynamicSharedMemorySize, 228<<10) at
-        # kernel launch to unlock full 4-stage pipeline for Blackwell.
-        return 8, 3, 2
-    if sm_major >= 9:    # Hopper (SM 9.0: H100/H200)
-        return 8, 3, 2
-    if sm_major >= 8:    # Ampere / Ada (SM 8.x: RTX 30/40xx, A100)
-        return 4, 2, 1
-    return 4, 1, 1       # Turing and earlier
+    # Empirically verified: w4 s2 consistently wins or ties across
+    # Turing, Ampere, Ada, Hopper, and Blackwell at S=512..131072.
+    return 4, 2, 2
 
 _KNL_WARPS, _KNL_STAGES_FWD, _KNL_STAGES_BWD = _get_blackwell_kernel_config()
 # Short aliases used at kernel launch sites
 _KW, _KS, _KS_FWD = _KNL_WARPS, _KNL_STAGES_BWD, _KNL_STAGES_FWD
+
+# =============================================================================
+# ADAPTIVE KERNEL AUTO-TUNER  (inline, first-call, torch.compile-style)
+# =============================================================================
+# The optimal (num_warps, num_stages) depends on (GPU register file × head dim D),
+# NOT on sequence length or total model parameters.  Empirically verified: the
+# winner is the same at S=512 through S=131072 on each tested GPU.
+#
+# Approach (inspired by torch.compile mode="max-autotune"):
+#   1. First real forward call for a given (H, D): inline-benchmark all candidate
+#      configs using the ACTUAL q/k/v tensors.  Cost: ~10ms, one time per (H, D).
+#   2. First real backward call: benchmark during the existing CUDA graph warmup.
+#   3. Cache by (GPU_name, op, H, D) — no S dimension (S-independent).
+#   4. Persist to disk for cross-restart reuse.
+#   5. No user-facing calibrate() required — fully transparent.
+#
+# The forward kernel runs inline (no CUDA graph), so the auto-tune happens as
+# part of the normal first-call JIT compilation overhead.  The backward kernels
+# use CUDA graphs, and the auto-tune is folded into the warmup that already
+# runs before graph capture.
+# =============================================================================
+
+class _KernelAutoTuner:
+    """Inline first-call auto-tuner for Triton kernel launch parameters.
+
+    Unlike per-S tuning, this benchmarks once per (GPU, op, H, D) — the optimal
+    warp config is S-independent (verified empirically across S=512..131072).
+    On first forward/backward call with unseen (H, D), benchmarks 4 candidate
+    configs using the ACTUAL tensors in-flight, picks the fastest, and caches
+    the result.  Subsequent calls are a dict lookup with zero overhead.
+
+    Thread-safe via a lock on the cache dict.
+    """
+
+    # Candidate configs: (num_warps, num_stages).
+    CANDIDATES = [(4, 1), (4, 2), (8, 2), (8, 3)]
+
+    # Benchmark shots (kept small: ~10ms total per tune)
+    _WARMUP = 3
+    _REPEATS = 5
+
+    def __init__(self):
+        self._cache: dict[str, tuple[int, int]] = {}
+        self._lock = threading.Lock()
+        self._cache_file = os.path.join(
+            os.path.expanduser("~"), ".cache", "cron_root_attention",
+            "autotune_v14.json"
+        )
+        self._load_cache()
+
+    # ── Persistence ───────────────────────────────────────────────────
+    def _load_cache(self):
+        try:
+            if os.path.isfile(self._cache_file):
+                with open(self._cache_file, "r") as f:
+                    raw = json.load(f)
+                self._cache = {k: tuple(v) for k, v in raw.items()}
+        except Exception:
+            self._cache = {}
+
+    def _save_cache(self):
+        try:
+            os.makedirs(os.path.dirname(self._cache_file), exist_ok=True)
+            with open(self._cache_file, "w") as f:
+                json.dump({k: list(v) for k, v in self._cache.items()}, f)
+        except Exception:
+            pass
+
+    # ── Key construction ──────────────────────────────────────────────
+    @staticmethod
+    def _gpu_tag() -> str:
+        if not torch.cuda.is_available():
+            return "cpu"
+        prop = torch.cuda.get_device_properties(torch.cuda.current_device())
+        return f"sm{prop.major}{prop.minor}_{prop.name.replace(' ', '_')}"
+
+    def _cache_key(self, op: str, H: int, D: int) -> str:
+        """Key by (GPU, op, H, D) only — optimal config is S-independent."""
+        return f"{self._gpu_tag()}|{op}|H{H}|D{D}"
+
+    # ── Lookup (zero overhead on hot path) ────────────────────────────
+    def get_config(self, op: str, H: int, D: int) -> tuple[int, int]:
+        """Return the cached (num_warps, num_stages) or static default."""
+        key = self._cache_key(op, H, D)
+        with self._lock:
+            hit = self._cache.get(key)
+        if hit is not None:
+            return hit
+        # Not yet tuned: return static default.  The next section
+        # (_tune_fwd_inline / _tune_bwd_inline) will tune on first call.
+        return (_KW, _KS_FWD) if op == "fwd" else (_KW, _KS)
+
+    def is_tuned(self, op: str, H: int, D: int) -> bool:
+        key = self._cache_key(op, H, D)
+        with self._lock:
+            return key in self._cache
+
+    # Minimum S for benchmarking — below this, kernel time is <0.1ms and
+    # measurement noise dominates, causing random config selection.
+    _MIN_BENCH_S = 4096
+
+    # ── Inline forward auto-tune ──────────────────────────────────────
+    def tune_fwd_inline(self, q, k, v, o, L, relay_k, relay_v,
+                        S, D, SQRT_N, NUM_RELAY, BLOCK_RELAY,
+                        BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE,
+                        kv_groups, H_q, B) -> tuple[int, int]:
+        """Benchmark forward tiled kernel.  Called once per (H, D) on the
+        first forward pass — adds ~10ms to the first step.
+
+        If S < _MIN_BENCH_S, allocates a synthetic tensor at _MIN_BENCH_S
+        to ensure enough compute for reliable timing.
+        """
+        key = self._cache_key("fwd", H_q, D)
+        with self._lock:
+            hit = self._cache.get(key)
+            if hit is not None:
+                return hit
+
+        # Use a representative S for benchmarking
+        bench_S = max(S, self._MIN_BENCH_S)
+        if bench_S != S:
+            bench_SQRT_N = int(math.ceil(math.sqrt(bench_S)))
+            bench_NUM_RELAY = (bench_S + bench_SQRT_N - 1) // bench_SQRT_N
+            bench_q = torch.randn(1, H_q, bench_S, D, device=q.device, dtype=q.dtype)
+            bench_k = torch.randn(1, H_q, bench_S, D, device=q.device, dtype=q.dtype)
+            bench_v = torch.randn(1, H_q, bench_S, D, device=q.device, dtype=q.dtype)
+            bench_o = torch.empty_like(bench_q)
+            bench_L = torch.empty(1, H_q, bench_S, dtype=torch.float32, device=q.device)
+            bench_rk = torch.randn(1, H_q, bench_NUM_RELAY, D, device=q.device, dtype=q.dtype)
+            bench_rv = torch.randn(1, H_q, bench_NUM_RELAY, D, device=q.device, dtype=q.dtype)
+            bench_B = 1
+        else:
+            bench_SQRT_N, bench_NUM_RELAY = SQRT_N, NUM_RELAY
+            bench_q, bench_k, bench_v = q, k, v
+            bench_o, bench_L = o, L
+            bench_rk, bench_rv = relay_k, relay_v
+            bench_B = B
+
+        grid = (bench_B, H_q, (bench_S + BLOCK_M - 1) // BLOCK_M)
+        best_time = float("inf")
+        best_cfg = (_KW, _KS_FWD)
+
+        for nw, ns in self.CANDIDATES:
+            try:
+                for _ in range(self._WARMUP):
+                    _cron_root_attn_fwd_v14_tiled[grid](
+                        bench_q, bench_k, bench_v, bench_o, bench_L, bench_rk, bench_rv,
+                        bench_q.stride(0), bench_q.stride(1), bench_q.stride(2), bench_q.stride(3),
+                        bench_k.stride(0), bench_k.stride(1), bench_k.stride(2), bench_k.stride(3),
+                        bench_v.stride(0), bench_v.stride(1), bench_v.stride(2), bench_v.stride(3),
+                        bench_o.stride(0), bench_o.stride(1), bench_o.stride(2), bench_o.stride(3),
+                        bench_L.stride(0), bench_L.stride(1), bench_L.stride(2),
+                        bench_rk.stride(0), bench_rk.stride(1), bench_rk.stride(2), bench_rk.stride(3),
+                        bench_rv.stride(0), bench_rv.stride(1), bench_rv.stride(2), bench_rv.stride(3),
+                        S=bench_S, D=D, SQRT_N=bench_SQRT_N,
+                        NUM_RELAY=bench_NUM_RELAY, BLOCK_RELAY=BLOCK_RELAY,
+                        BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
+                        BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
+                        KV_GROUPS=kv_groups,
+                        num_warps=nw, num_stages=ns)
+                torch.cuda.synchronize()
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                for _ in range(self._REPEATS):
+                    _cron_root_attn_fwd_v14_tiled[grid](
+                        bench_q, bench_k, bench_v, bench_o, bench_L, bench_rk, bench_rv,
+                        bench_q.stride(0), bench_q.stride(1), bench_q.stride(2), bench_q.stride(3),
+                        bench_k.stride(0), bench_k.stride(1), bench_k.stride(2), bench_k.stride(3),
+                        bench_v.stride(0), bench_v.stride(1), bench_v.stride(2), bench_v.stride(3),
+                        bench_o.stride(0), bench_o.stride(1), bench_o.stride(2), bench_o.stride(3),
+                        bench_L.stride(0), bench_L.stride(1), bench_L.stride(2),
+                        bench_rk.stride(0), bench_rk.stride(1), bench_rk.stride(2), bench_rk.stride(3),
+                        bench_rv.stride(0), bench_rv.stride(1), bench_rv.stride(2), bench_rv.stride(3),
+                        S=bench_S, D=D, SQRT_N=bench_SQRT_N,
+                        NUM_RELAY=bench_NUM_RELAY, BLOCK_RELAY=BLOCK_RELAY,
+                        BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
+                        BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
+                        KV_GROUPS=kv_groups,
+                        num_warps=nw, num_stages=ns)
+                end.record()
+                torch.cuda.synchronize()
+                t = start.elapsed_time(end) / self._REPEATS
+                if t < best_time:
+                    best_time = t
+                    best_cfg = (nw, ns)
+            except Exception:
+                continue
+
+        # Clean up synthetic tensors
+        if bench_S != S:
+            del bench_q, bench_k, bench_v, bench_o, bench_L, bench_rk, bench_rv
+
+        with self._lock:
+            self._cache[key] = best_cfg
+            self._save_cache()
+        return best_cfg
+
+    # ── Inline backward auto-tune ─────────────────────────────────────
+    def tune_bwd_inline(self, kernel_fn, grid, args, kwargs,
+                        H: int, D: int) -> tuple[int, int]:
+        """Benchmark a backward kernel with actual tensors.  Called during
+        the CUDA graph warmup that already happens before graph capture.
+
+        If the tensors' S < _MIN_BENCH_S, allocates synthetic tensors at
+        _MIN_BENCH_S for reliable timing (same (H, D) characterization).
+        """
+        key = self._cache_key("bwd", H, D)
+        with self._lock:
+            hit = self._cache.get(key)
+            if hit is not None:
+                return hit
+
+        # Check if we need synthetic tensors for reliable timing
+        S = kwargs.get("S", 0)
+        if S < self._MIN_BENCH_S:
+            return self._tune_bwd_synthetic(H, D, args[0].device, args[0].dtype)
+
+        best_time = float("inf")
+        best_cfg = (_KW, _KS)
+
+        for nw, ns in self.CANDIDATES:
+            try:
+                for _ in range(self._WARMUP):
+                    kernel_fn[grid](*args, num_warps=nw, num_stages=ns, **kwargs)
+                torch.cuda.synchronize()
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                for _ in range(self._REPEATS):
+                    kernel_fn[grid](*args, num_warps=nw, num_stages=ns, **kwargs)
+                end.record()
+                torch.cuda.synchronize()
+                t = start.elapsed_time(end) / self._REPEATS
+                if t < best_time:
+                    best_time = t
+                    best_cfg = (nw, ns)
+            except Exception:
+                continue
+
+        with self._lock:
+            self._cache[key] = best_cfg
+            self._save_cache()
+        return best_cfg
+
+    def _tune_bwd_synthetic(self, H: int, D: int,
+                            device, dtype) -> tuple[int, int]:
+        """Backward auto-tune using synthetic tensors at _MIN_BENCH_S."""
+        S = self._MIN_BENCH_S
+        B = 1
+        SQRT_N = int(math.ceil(math.sqrt(S)))
+        BLOCK_M = BLOCK_D = BLOCK_LOCAL = BLOCK_STRIDE = BLOCK_RELAY = 64
+        num_tiles_m = (S + BLOCK_M - 1) // BLOCK_M
+
+        q  = torch.randn(B, H, S, D, device=device, dtype=dtype)
+        k  = torch.randn(B, H, S, D, device=device, dtype=dtype)
+        v  = torch.randn(B, H, S, D, device=device, dtype=dtype)
+        o  = torch.randn(B, H, S, D, device=device, dtype=dtype)
+        do = torch.randn(B, H, S, D, device=device, dtype=dtype)
+        dq = torch.empty_like(q)
+        L  = torch.randn(B, H, S, dtype=torch.float32, device=device)
+        NUM_RELAY = (S + SQRT_N - 1) // SQRT_N
+        rk = torch.randn(B, H, NUM_RELAY, D, device=device, dtype=dtype)
+        rv = torch.randn(B, H, NUM_RELAY, D, device=device, dtype=dtype)
+
+        grid = (B, H, num_tiles_m)
+        bench_args = (
+            q, k, v, o, do, dq, L, rk, rv,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+            do.stride(0), do.stride(1), do.stride(2), do.stride(3),
+            dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
+            L.stride(0), L.stride(1), L.stride(2),
+            rk.stride(0), rk.stride(1), rk.stride(2), rk.stride(3),
+            rv.stride(0), rv.stride(1), rv.stride(2), rv.stride(3))
+        bench_kwargs = dict(
+            S=S, D=D, SQRT_N=SQRT_N,
+            NUM_RELAY=0, BLOCK_RELAY=BLOCK_RELAY,
+            BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
+            BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE)
+
+        best_time = float("inf")
+        best_cfg = (_KW, _KS)
+
+        for nw, ns in self.CANDIDATES:
+            try:
+                for _ in range(self._WARMUP):
+                    _cron_root_attn_bwd_dq_only_v14[grid](
+                        *bench_args, num_warps=nw, num_stages=ns, **bench_kwargs)
+                torch.cuda.synchronize()
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                for _ in range(self._REPEATS):
+                    _cron_root_attn_bwd_dq_only_v14[grid](
+                        *bench_args, num_warps=nw, num_stages=ns, **bench_kwargs)
+                end.record()
+                torch.cuda.synchronize()
+                t = start.elapsed_time(end) / self._REPEATS
+                if t < best_time:
+                    best_time = t
+                    best_cfg = (nw, ns)
+            except Exception:
+                continue
+
+        del q, k, v, o, do, dq, L, rk, rv
+
+        with self._lock:
+            self._cache[self._cache_key("bwd", H, D)] = best_cfg
+            self._save_cache()
+        return best_cfg
+
+    def clear(self):
+        """Clear in-memory and on-disk cache (forces re-tuning)."""
+        with self._lock:
+            self._cache.clear()
+        try:
+            if os.path.isfile(self._cache_file):
+                os.remove(self._cache_file)
+        except Exception:
+            pass
+
+
+# Singleton auto-tuner instance
+_tuner = _KernelAutoTuner()
 
 # =============================================================================
 # BLACKWELL-OPTIMISED TRITON GEMM
@@ -2430,6 +2753,29 @@ class CronRootAttentionV14Function(torch.autograd.Function):
         # Select NUM_Q_TILES: parallelize the O(N) query loop across tiles
         NUM_Q_TILES_STRIDED = 1 if S <= 256 else (2 if S <= 512 else 4)
 
+        # Inline auto-tune: first backward per (H, D) benchmarks dQ kernel
+        if not _tuner.is_tuned("bwd", H_q, D):
+            _tuner.tune_bwd_inline(
+                _cron_root_attn_bwd_dq_only_v14,
+                (B, H_q, num_tiles_m),
+                (q, k, v, o, do, dq, L,
+                 relay_k, relay_v,
+                 q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+                 k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+                 v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+                 o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+                 do.stride(0), do.stride(1), do.stride(2), do.stride(3),
+                 dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
+                 L.stride(0), L.stride(1), L.stride(2),
+                 relay_k.stride(0), relay_k.stride(1), relay_k.stride(2), relay_k.stride(3),
+                 relay_v.stride(0), relay_v.stride(1), relay_v.stride(2), relay_v.stride(3)),
+                dict(S=S, D=D, SQRT_N=SQRT_N,
+                     NUM_RELAY=0, BLOCK_RELAY=BLOCK_RELAY,
+                     BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
+                     BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE),
+                H=H_q, D=D)
+        bwd_nw, bwd_ns = _tuner.get_config("bwd", H_q, D)
+
         _cron_root_attn_bwd_dq_only_v14[(B, H_q, num_tiles_m)](
             q, k, v, o, do, dq, L,
             relay_k, relay_v,
@@ -2446,7 +2792,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             NUM_RELAY=0, BLOCK_RELAY=BLOCK_RELAY,
             BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
             BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
-            num_warps=_KW, num_stages=_KS,
+            num_warps=bwd_nw, num_stages=bwd_ns,
         )
         _dkdv_local_phase[(B, H_q, num_tiles_n)](
             q, k, v, o, do, dk, dv, L,
@@ -2460,7 +2806,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             L.stride(0), L.stride(1), L.stride(2),
             S=S, D=D, SQRT_N=SQRT_N,
             BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, BLOCK_Q=BLOCK_Q,
-            num_warps=_KW, num_stages=_KS,
+            num_warps=bwd_nw, num_stages=bwd_ns,
         )
         if num_strided > 0:
             _dkdv_strided_key_centric[(num_strided * NUM_Q_TILES_STRIDED, B, H_q)](
@@ -2476,7 +2822,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                 S=S, D=D, SQRT_N=SQRT_N,
                 BLOCK_Q=BLOCK_Q_STRIDED, BLOCK_D=BLOCK_D,
                 NUM_Q_TILES=NUM_Q_TILES_STRIDED,
-                num_warps=_KW, num_stages=_KS,
+                num_warps=bwd_nw, num_stages=bwd_ns,
             )
 
     @staticmethod
@@ -2575,6 +2921,9 @@ class CronRootAttentionV14Function(torch.autograd.Function):
         # Select NUM_Q_TILES: parallelize the O(N) query loop across tiles
         NUM_Q_TILES_STRIDED = 1 if S <= 256 else (2 if S <= 512 else 4)
 
+        # Reuse cached bwd config (tuned by split3 MHA or tune_bwd_inline)
+        bwd_nw, bwd_ns = _tuner.get_config("bwd", H_q, D)
+
         # dQ kernel: Q-head-centric, reads K/V at (h_q // KV_GROUPS)
         _cron_root_attn_bwd_dq_only_v14[(B, H_q, num_tiles_m)](
             q, k, v, o, do, dq, L,
@@ -2593,7 +2942,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
             BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
             KV_GROUPS=KV_GROUPS,
-            num_warps=_KW, num_stages=_KS,
+            num_warps=bwd_nw, num_stages=bwd_ns,
         )
         # dK/dV local phase: KV-head-centric, direct store (no atomics)
         _dkdv_local_phase_gqa[(B, H_kv, num_kv_tiles)](
@@ -2609,7 +2958,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             S=S, D=D, SQRT_N=SQRT_N,
             BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, BLOCK_Q=BLOCK_Q,
             KV_GROUPS=KV_GROUPS,
-            num_warps=_KW, num_stages=_KS,
+            num_warps=bwd_nw, num_stages=bwd_ns,
         )
         # dK/dV strided phase: KV-head-centric, atomic_add merges with local
         if num_strided > 0:
@@ -2626,7 +2975,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                 S=S, D=D, SQRT_N=SQRT_N,
                 BLOCK_Q=BLOCK_Q_STRIDED, BLOCK_D=BLOCK_D,
                 KV_GROUPS=KV_GROUPS, NUM_Q_TILES=NUM_Q_TILES_STRIDED,
-                num_warps=_KW, num_stages=_KS,
+                num_warps=bwd_nw, num_stages=bwd_ns,
             )
 
     @staticmethod
@@ -2718,6 +3067,8 @@ class CronRootAttentionV14Function(torch.autograd.Function):
         BLOCK_Q_RELAY      = 64
         _BLOCK_D_RELAY     = triton.next_power_of_2(D)
 
+        bwd_nw, bwd_ns = _tuner.get_config("bwd", H_q, D)
+
         # dQ-only (includes relay contribution to dQ)
         _cron_root_attn_bwd_dq_only_v14[(B, H_q, num_tiles_m)](
             q, k, v, o, do, dq, L,
@@ -2736,7 +3087,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
             BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
             KV_GROUPS=1,
-            num_warps=_KW, num_stages=_KS,
+            num_warps=bwd_nw, num_stages=bwd_ns,
         )
         # local dK/dV
         _dkdv_local_phase[(B, H_q, num_tiles_n)](
@@ -2751,7 +3102,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             L.stride(0), L.stride(1), L.stride(2),
             S=S, D=D, SQRT_N=SQRT_N,
             BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, BLOCK_Q=BLOCK_Q,
-            num_warps=_KW, num_stages=_KS,
+            num_warps=bwd_nw, num_stages=bwd_ns,
         )
         # strided dK/dV
         if num_strided_keys > 0:
@@ -2768,7 +3119,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                 S=S, D=D, SQRT_N=SQRT_N,
                 BLOCK_Q=BLOCK_Q_STRIDED, BLOCK_D=BLOCK_D,
                 NUM_Q_TILES=NUM_Q_TILES_STRIDED,
-                num_warps=_KW, num_stages=_KS,
+                num_warps=bwd_nw, num_stages=bwd_ns,
             )
         # relay dK/dV (MHA: H_q heads)
         _dkdv_relay_v14[(NUM_RELAY, B, H_q)](
@@ -2982,6 +3333,16 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             )
         else:
             # Standard tiled kernel path (fixed grid; supports relay for S > 8192)
+            # Inline auto-tune: first call per (H, D) benchmarks all candidates
+            # using these actual tensors (~10ms one-time), then caches.
+            if not _tuner.is_tuned("fwd", H_q, D):
+                fwd_nw, fwd_ns = _tuner.tune_fwd_inline(
+                    q, k, v, o, L, relay_k, relay_v,
+                    S, D, SQRT_N, NUM_RELAY, BLOCK_RELAY,
+                    BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE,
+                    kv_groups, H_q, B)
+            else:
+                fwd_nw, fwd_ns = _tuner.get_config("fwd", H_q, D)
             _cron_root_attn_fwd_v14_tiled[(B, H_q, num_tiles)](
                 q, k, v, o, L,
                 relay_k, relay_v,
@@ -2997,7 +3358,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                 BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
                 BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
                 KV_GROUPS=kv_groups,
-                num_warps=_KW, num_stages=_KS_FWD,
+                num_warps=fwd_nw, num_stages=fwd_ns,
             )
         
         ctx.save_for_backward(q, k, v, o, L, relay_k, relay_v, relay_w)

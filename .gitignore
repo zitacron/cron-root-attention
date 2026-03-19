@@ -9,3 +9,8 @@ build/
 .pytest_cache/
 .tox/
 .mypy_cache/
+examples/bench_gpu0.py
+examples/benchmark_paper_v2.py
+examples/bench_gpu1.py
+paper/benchmark_data_gpu0.json
+paper/benchmark_data_gpu1.json
