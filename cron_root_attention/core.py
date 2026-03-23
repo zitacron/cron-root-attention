@@ -378,6 +378,7 @@ class _KernelAutoTuner:
                         BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
                         BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
                         KV_GROUPS=kv_groups,
+                        TOP_K=2,
                         num_warps=nw, num_stages=ns)
                 torch.cuda.synchronize()
                 start = torch.cuda.Event(enable_timing=True)
@@ -398,6 +399,7 @@ class _KernelAutoTuner:
                         BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
                         BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
                         KV_GROUPS=kv_groups,
+                        TOP_K=2,
                         num_warps=nw, num_stages=ns)
                 end.record()
                 torch.cuda.synchronize()
@@ -500,7 +502,8 @@ class _KernelAutoTuner:
             S=S, D=D, SQRT_N=SQRT_N,
             NUM_RELAY=0, BLOCK_RELAY=BLOCK_RELAY,
             BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
-            BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE)
+            BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
+            TOP_K=2)
 
         best_time = float("inf")
         best_cfg = (_KW, _KS)
@@ -875,6 +878,7 @@ def _cron_root_attn_fwd_v14_tiled(
     BLOCK_STRIDE: tl.constexpr,
     BLOCK_RELAY: tl.constexpr,
     KV_GROUPS: tl.constexpr,  # K/V heads per Q head (1 = MHA, >1 = GQA)
+    TOP_K: tl.constexpr = 2,  # Relay tokens per block (for block masking)
 ):
     """
     Non-persistent tiled kernel: One thread block per (B, H, tile_m).
@@ -1060,9 +1064,10 @@ def _cron_root_attn_fwd_v14_tiled(
         # Compute scores: [BLOCK_M, BLOCK_RELAY]
         scores = tl.dot(q, tl.trans(rk)) * scale
         
-        # Mask: relay block r is accessible if block end < local_start(m)
-        # Block r covers positions [r*SQRT_N, (r+1)*SQRT_N - 1]
-        block_ends = (r_indices + 1) * SQRT_N - 1
+        # Mask: relay token t belongs to block (t // TOP_K).
+        # Block (t // TOP_K) covers positions [(t//TOP_K)*SQRT_N, (t//TOP_K+1)*SQRT_N - 1].
+        # Accessible when block_end < local_start(m).
+        block_ends = (r_indices // TOP_K + 1) * SQRT_N - 1
         relay_mask = (block_ends[None, :] < local_starts[:, None])
         full_mask = relay_mask & r_valid[None, :] & m_mask[:, None]
         scores = tl.where(full_mask, scores, float('-inf'))
@@ -1131,6 +1136,7 @@ def _cron_root_attn_bwd_dq_only_v14(
     BLOCK_LOCAL: tl.constexpr, BLOCK_STRIDE: tl.constexpr,
     BLOCK_RELAY: tl.constexpr,
     KV_GROUPS: tl.constexpr = 1,
+    TOP_K: tl.constexpr = 2,  # Relay tokens per block (for block masking)
 ):
     """
     dQ-only backward kernel with relay support.
@@ -1246,7 +1252,7 @@ def _cron_root_attn_bwd_dq_only_v14(
                     mask=r_valid[:, None] & (d_idx[None, :] < D), other=0.0)
         
         scores = tl.dot(q, tl.trans(rk)) * scale
-        block_ends = (r_indices + 1) * SQRT_N - 1
+        block_ends = (r_indices // TOP_K + 1) * SQRT_N - 1
         relay_mask = (block_ends[None, :] < local_starts[:, None])
         full_mask = relay_mask & r_valid[None, :] & m_mask[:, None]
         scores = tl.where(full_mask, scores, float('-inf'))
@@ -2341,6 +2347,7 @@ def _dkdv_relay_v14(
     S: tl.constexpr, D: tl.constexpr, SQRT_N: tl.constexpr,
     NUM_RELAY: tl.constexpr,
     BLOCK_Q: tl.constexpr, BLOCK_D: tl.constexpr,
+    TOP_K: tl.constexpr = 2,  # Relay tokens per block (for block masking)
 ):
     """
     Relay-centric dRK/dRV kernel (2-hop backward).
@@ -2373,8 +2380,9 @@ def _dkdv_relay_v14(
     
     scale = 1.0 / tl.sqrt(tl.cast(D, tl.float32))
     
-    # This relay block ends at position (relay_idx + 1) * SQRT_N - 1
-    block_end = (relay_idx + 1) * SQRT_N - 1
+    # Relay token relay_idx belongs to block (relay_idx // TOP_K).
+    # That block ends at position (relay_idx // TOP_K + 1) * SQRT_N - 1.
+    block_end = (relay_idx // TOP_K + 1) * SQRT_N - 1
     
     # Only queries with local_start > block_end attend to this relay
     # local_start(m) = max(m - SQRT_N + 1, 0) > block_end
@@ -2549,166 +2557,170 @@ def _dkdv_relay_v14_gqa(
 
 
 # =============================================================================
-# RELAY PRECOMPUTE KERNEL  (norm²-weighted pooling for higher relay fidelity)
+# RELAY PRECOMPUTE KERNEL  (top-K exact-token selection for zero-distortion relay)
 # =============================================================================
 #
-# Previous design: relay_k[r] = mean(K[r*N:(r+1)*N])  -- uniform pooling
-# Problem: mean(K) collapses dot products; q·mean(K) = mean(q·Kᵢ), so low-norm
-#          tokens dilute the relay key and high-information tokens are ignored.
+# Previous: norm²-weighted pooling — relay_k[r] = Σ wᵢ·kᵢ
+# Problem:  weighted pooling is still a blurry average; q·relay_k blends all
+#           tokens regardless of which one actually matters for a given query.
+#           Both routing (key) and retrieval (value) are imprecise.
 #
-# New design: relay_k[r] = Σ wᵢ · Kᵢ  where wᵢ = ‖Kᵢ‖² / Σⱼ ‖Kⱼ‖²
-# Rationale:  High-norm keys (more "informative" tokens) dominate the relay
-#             representative.  Attention score q·relay_k = Σ wᵢ (q·Kᵢ) is a
-#             importance-weighted average of the real scores — strictly better
-#             than the uniform mean for locating what matters in each block.
+# New design: exact top-K selection.
+#   relay_k[r*K+j] = k[top_j(r)]   — exact key of j-th highest-‖k‖² token
+#   relay_v[r*K+j] = v[top_j(r)]   — its exact matching value (no blurring)
+#   relay_src[r*K+j] = float32(abs_pos)  — source position for backward scatter
 #
-# Two passes over K (and one over V):
-#   Pass 1: compute ‖Kᵢ‖² for each position i, accumulate total_norm_sq.
-#   Pass 2: w_i = ‖Kᵢ‖² / total_norm_sq, accumulate weighted K and V sums,
-#           store wᵢ into relay_w[b,h,r,i] for use in the backward scatter.
+# With K=2: each block contributes 2 exact representative tokens.
+# Total relay tokens: NUM_RELAY_BLOCKS * K, still O(K·√N) per sequence.
 #
-# relay_w is identical for both K and V (K-norm drive the importance weights).
+# Memory profile vs old pooling (K=2, SQRT_N=64, D=128):
+#   Old: reads 64 K rows + 64 V rows = 128 rows
+#   New: reads 64 K rows (norm scan) + 2 K rows + 2 V rows = 68 rows  (47% less)
+#
+# Algorithm:
+#   Pass 1: scan SQRT_N positions, compute ‖kᵢ‖², track top-K indices in registers.
+#   Pass 2: load exact k/v at top-K positions and write to relay_k/v/src.
 # =============================================================================
 
 @triton.jit
-def _relay_precompute_fwd(
-    K, V, relay_k, relay_v, relay_w,
+def _relay_precompute_topk(
+    K, V, relay_k, relay_v, relay_src,
     stride_kb, stride_kh, stride_ks, stride_kd,
     stride_vb, stride_vh, stride_vs, stride_vd,
-    stride_rkb, stride_rkh, stride_rkr, stride_rkd,
-    stride_rvb, stride_rvh, stride_rvr, stride_rvd,
-    stride_rwb, stride_rwh, stride_rwr, stride_rws,
+    stride_rkb, stride_rkh, stride_rkt, stride_rkd,
+    stride_rvb, stride_rvh, stride_rvt, stride_rvd,
+    stride_rsb, stride_rsh, stride_rst,
     H_kv,
     S: tl.constexpr, D: tl.constexpr,
-    SQRT_N: tl.constexpr, BLOCK_D: tl.constexpr,
+    SQRT_N: tl.constexpr, TOP_K: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
     """
-    Norm²-weighted relay precompute — single-pass fused.
+    Top-K exact-token relay pre-computation.
 
-    Grid: (B * H_kv, NUM_RELAY)
-    Each program processes one SQRT_N-element block, producing one slot of
-    relay_k / relay_v (norm²-weighted K/V) and relay_w (per-position weights).
+    Grid: (B * H_kv, NUM_RELAY_BLOCKS)
+    Each program selects the TOP_K tokens with highest ‖k‖² within its
+    SQRT_N-element block and stores their exact k/v vectors plus source
+    positions for the scatter backward pass.
 
-    Single-pass approach: accumulate norm²*K and norm²*V alongside total_norm_sq,
-    then divide at the end.  Eliminates the second K read entirely (saves
-    SQRT_N × D × 2 bytes of global memory bandwidth per relay block).
+    relay_k/v : [B, H_kv, NUM_RELAY_BLOCKS * TOP_K, D]
+    relay_src  : [B, H_kv, NUM_RELAY_BLOCKS * TOP_K]  float32 source index
     """
     bh = tl.program_id(0)   # linearized (batch * H_kv)
-    r  = tl.program_id(1)   # relay slot index
+    r  = tl.program_id(1)   # relay block index
 
-    b  = bh // H_kv
-    h  = bh %  H_kv
+    b = bh // H_kv
+    h = bh %  H_kv
 
-    # Sequence range for this relay slot
     s_start = r * SQRT_N
+    d_idx   = tl.arange(0, BLOCK_D)
+    d_mask  = d_idx < D
+    k_base  = K + b * stride_kb + h * stride_kh
 
-    d_idx  = tl.arange(0, BLOCK_D)
-    d_mask = d_idx < D
-
-    k_base = K + b * stride_kb + h * stride_kh
-    v_base = V + b * stride_vb + h * stride_vh
-    rw_base = relay_w + b * stride_rwb + h * stride_rwh + r * stride_rwr
-
-    # ── Single pass: load K and V once, accumulate norm²*K, norm²*V,
-    #    total_norm_sq, and store per-position norm² for backward. ─────
-    total_norm_sq = 0.0
-    k_weighted = tl.zeros([BLOCK_D], dtype=tl.float32)
-    v_weighted = tl.zeros([BLOCK_D], dtype=tl.float32)
+    # ── Pass 1: scan norm² for all positions, track top-2 ─────────────────────
+    # Sentinel: valid norms are ≥ 0, so -1e38 marks "unset".
+    SENT = -1e38
+    best0_nsq = tl.full([], SENT, dtype=tl.float32)
+    best0_idx = tl.zeros([], dtype=tl.int32)
+    best1_nsq = tl.full([], SENT, dtype=tl.float32)
+    best1_idx = tl.zeros([], dtype=tl.int32)
 
     for i in range(SQRT_N):
         s_i     = s_start + i
         valid_i = s_i < S
-        smask   = d_mask & valid_i
         k_row   = tl.load(k_base + s_i * stride_ks + d_idx * stride_kd,
-                          mask=smask, other=0.0).to(tl.float32)
-        v_row   = tl.load(v_base + s_i * stride_vs + d_idx * stride_vd,
-                          mask=smask, other=0.0).to(tl.float32)
+                          mask=d_mask & valid_i, other=0.0).to(tl.float32)
         n_sq    = tl.sum(k_row * k_row)
-        n_sq    = tl.where(valid_i, n_sq, 0.0)
-        total_norm_sq = total_norm_sq + n_sq
-        # Accumulate norm²-weighted sums (will normalize after loop)
-        k_weighted = k_weighted + n_sq * k_row
-        v_weighted = v_weighted + n_sq * v_row
-        # Store raw norm² per position (normalize to w_i after loop)
-        tl.store(rw_base + i * stride_rws, n_sq.to(relay_w.dtype.element_ty))
+        n_sq    = tl.where(valid_i, n_sq, tl.full([], SENT, dtype=tl.float32))
+        i_t     = tl.full([], i, dtype=tl.int32)
+        beats0  = n_sq > best0_nsq
+        beats1  = n_sq > best1_nsq
+        # Update top-2 (evaluate new top1 before overwriting top0)
+        new1_nsq = tl.where(beats0, best0_nsq, tl.where(beats1, n_sq,  best1_nsq))
+        new1_idx = tl.where(beats0, best0_idx, tl.where(beats1, i_t,   best1_idx))
+        best0_nsq = tl.where(beats0, n_sq, best0_nsq)
+        best0_idx = tl.where(beats0, i_t,  best0_idx)
+        best1_nsq = new1_nsq
+        best1_idx = new1_idx
 
-    # ── Normalize: weighted_sum / total_norm_sq → relay_k/v ────────────
-    inv_total = 1.0 / (total_norm_sq + 1e-8)
-    k_weighted = k_weighted * inv_total
-    v_weighted = v_weighted * inv_total
+    abs0 = s_start + best0_idx   # absolute sequence position of best token
+    abs1 = s_start + best1_idx   # absolute sequence position of 2nd-best token
 
-    # ── Normalize stored weights: w_i = norm²_i / total_norm_sq ────────
-    for i in range(SQRT_N):
-        raw = tl.load(rw_base + i * stride_rws).to(tl.float32)
-        tl.store(rw_base + i * stride_rws, (raw * inv_total).to(relay_w.dtype.element_ty))
+    # ── Pass 2: load exact k/v at top positions, write relay tokens ────────────
+    rk_base = relay_k   + b * stride_rkb + h * stride_rkh
+    rv_base = relay_v   + b * stride_rvb + h * stride_rvh
+    rs_base = relay_src + b * stride_rsb + h * stride_rsh
 
-    rk_ptr = relay_k + b * stride_rkb + h * stride_rkh + r * stride_rkr
-    rv_ptr = relay_v + b * stride_rvb + h * stride_rvh + r * stride_rvr
-    tl.store(rk_ptr + d_idx * stride_rkd,
-             k_weighted.to(relay_k.dtype.element_ty), mask=d_mask)
-    tl.store(rv_ptr + d_idx * stride_rvd,
-             v_weighted.to(relay_v.dtype.element_ty), mask=d_mask)
+    t0 = r * TOP_K
+    k0 = tl.load(k_base + abs0 * stride_ks + d_idx * stride_kd, mask=d_mask, other=0.0)
+    v0 = tl.load(V + b * stride_vb + h * stride_vh + abs0 * stride_vs + d_idx * stride_vd,
+                 mask=d_mask, other=0.0)
+    tl.store(rk_base + t0 * stride_rkt + d_idx * stride_rkd, k0, mask=d_mask)
+    tl.store(rv_base + t0 * stride_rvt + d_idx * stride_rvd, v0, mask=d_mask)
+    tl.store(rs_base + t0 * stride_rst, tl.cast(abs0, tl.float32))
+
+    if TOP_K >= 2:
+        t1 = r * TOP_K + 1
+        k1 = tl.load(k_base + abs1 * stride_ks + d_idx * stride_kd, mask=d_mask, other=0.0)
+        v1 = tl.load(V + b * stride_vb + h * stride_vh + abs1 * stride_vs + d_idx * stride_vd,
+                     mask=d_mask, other=0.0)
+        tl.store(rk_base + t1 * stride_rkt + d_idx * stride_rkd, k1, mask=d_mask)
+        tl.store(rv_base + t1 * stride_rvt + d_idx * stride_rvd, v1, mask=d_mask)
+        tl.store(rs_base + t1 * stride_rst, tl.cast(abs1, tl.float32))
 
 
 # =============================================================================
-# RELAY SCATTER BACKWARD KERNEL  (norm²-weighted, matching precompute)
+# RELAY SCATTER BACKWARD KERNEL  (exact-index scatter, matching top-K precompute)
 # =============================================================================
 #
-# Previous: d_K_i += d_relay_k[r] / SQRT_N  (uniform, ignores why this key
-#           mattered more or less than others in its block)
-# New:      d_K_i += w_i · d_relay_k[r]    where w_i is the weight stored
-#           during the forward pass (stop-gradient on w_i for efficiency).
+# Previous weighted scatter: for each relay slot r, distributed gradient across
+# SQRT_N source positions using stored norm²-weights wᵢ.
 #
-# The stop-gradient approximation on wᵢ is standard for importance-weighted
-# pooling: the true gradient through wᵢ itself is a second-order correction
-# (small in practice) and omitting it avoids recomputing norms in backward.
+# New exact scatter: each relay token t = r*K+j stores one source position
+# (written by _relay_precompute_topk into relay_src[t]).  The kernel simply
+# scatters d_relay[t] to dK/dV[src_pos].
+#
+# tl.atomic_add is used because the last (partial) block may have fewer than
+# TOP_K valid tokens, causing t=r*K+0 and t=r*K+1 to map to the same src_pos.
+# For all full blocks the writes are to distinct rows — no contention.
 # =============================================================================
 
 @triton.jit
-def _relay_scatter_bwd(
-    d_relay, d_kv, relay_w,
-    stride_drb, stride_drh, stride_drr, stride_drd,
+def _relay_scatter_bwd_topk(
+    d_relay, d_kv, relay_src,
+    stride_drb, stride_drh, stride_drt, stride_drd,
     stride_dkvb, stride_dkvh, stride_dkvs, stride_dkvd,
-    stride_rwb, stride_rwh, stride_rwr, stride_rws,
+    stride_rsb, stride_rsh, stride_rst,
     H_kv,
-    S: tl.constexpr, D: tl.constexpr,
-    SQRT_N: tl.constexpr, BLOCK_D: tl.constexpr,
+    D: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
     """
-    Norm²-weighted relay scatter backward.
+    Top-K relay scatter backward.
 
-    Distributes d_relay[b,h,r,:] * w_i to d_kv[b,h,r*SQRT_N+i,:]
-    for each i in [0, SQRT_N) with s_i < S.
-
-    Grid: (B * H_kv, NUM_RELAY)
-    Relay slots are disjoint in sequence dim — plain load+store, no atomics.
+    Grid: (B * H_kv, NUM_RELAY_FLAT)
+    Each program owns one relay token t, loads its source position from
+    relay_src[b, h, t], and atomically accumulates d_relay[b, h, t, :]
+    into d_kv[b, h, src_pos, :].
     """
     bh = tl.program_id(0)
-    r  = tl.program_id(1)
+    t  = tl.program_id(1)
 
-    b  = bh // H_kv
-    h  = bh %  H_kv
-
-    s_start = r * SQRT_N
+    b = bh // H_kv
+    h = bh %  H_kv
 
     d_idx  = tl.arange(0, BLOCK_D)
     d_mask = d_idx < D
 
-    # Load relay gradient (D-dimensional vector)
-    dr_ptr = d_relay + b * stride_drb + h * stride_drh + r * stride_drr
-    dr = tl.load(dr_ptr + d_idx * stride_drd, mask=d_mask, other=0.0).to(tl.float32)
+    # Load gradient for this relay token [D]
+    dr_ptr = d_relay + b * stride_drb + h * stride_drh + t * stride_drt
+    dr = tl.load(dr_ptr + d_idx * stride_drd, mask=d_mask, other=0.0)
 
-    rw_base  = relay_w + b * stride_rwb + h * stride_rwh + r * stride_rwr
-    dkv_base = d_kv   + b * stride_dkvb + h * stride_dkvh
+    # Source position stored as float32 (exact for integers up to 2^24)
+    src_f   = tl.load(relay_src + b * stride_rsb + h * stride_rsh + t * stride_rst)
+    src_pos = src_f.to(tl.int32)
 
-    for i in range(SQRT_N):
-        s_i   = s_start + i
-        smask = d_mask & (s_i < S)
-        # Load per-position weight saved during forward
-        w_i = tl.load(rw_base + i * stride_rws).to(tl.float32)
-        ptr = dkv_base + s_i * stride_dkvs + d_idx * stride_dkvd
-        cur = tl.load(ptr, mask=smask, other=0.0).to(tl.float32)
-        tl.store(ptr, (cur + w_i * dr).to(d_kv.dtype.element_ty), mask=smask)
+    # Scatter gradient to the exact source row (atomic for safety on partial blocks)
+    dkv_ptr = d_kv + b * stride_dkvb + h * stride_dkvh + src_pos * stride_dkvs
+    tl.atomic_add(dkv_ptr + d_idx * stride_dkvd, dr.to(d_kv.dtype.element_ty), mask=d_mask)
 
 
 # =============================================================================
@@ -2772,7 +2784,8 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                 dict(S=S, D=D, SQRT_N=SQRT_N,
                      NUM_RELAY=0, BLOCK_RELAY=BLOCK_RELAY,
                      BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
-                     BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE),
+                     BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
+                     TOP_K=2),
                 H=H_q, D=D)
         bwd_nw, bwd_ns = _tuner.get_config("bwd", H_q, D)
 
@@ -2792,6 +2805,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             NUM_RELAY=0, BLOCK_RELAY=BLOCK_RELAY,
             BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
             BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
+            TOP_K=2,
             num_warps=bwd_nw, num_stages=bwd_ns,
         )
         _dkdv_local_phase[(B, H_q, num_tiles_n)](
@@ -2941,7 +2955,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             NUM_RELAY=0, BLOCK_RELAY=BLOCK_RELAY,
             BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
             BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
-            KV_GROUPS=KV_GROUPS,
+            KV_GROUPS=KV_GROUPS, TOP_K=2,
             num_warps=bwd_nw, num_stages=bwd_ns,
         )
         # dK/dV local phase: KV-head-centric, direct store (no atomics)
@@ -3052,9 +3066,9 @@ class CronRootAttentionV14Function(torch.autograd.Function):
     _relay4_graph_cache: dict = {}
 
     @staticmethod
-    def _relay4_launch(q, k, v, o, do, L, relay_k, relay_v, relay_w,
+    def _relay4_launch(q, k, v, o, do, L, relay_k, relay_v, relay_src,
                        dq, dk, dv, d_relay_k, d_relay_v,
-                       S, D, SQRT_N, NUM_RELAY,
+                       S, D, SQRT_N, NUM_RELAY, TOP_K,
                        BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE, BLOCK_RELAY,
                        B, H_q):
         """Raw 6-kernel relay4 MHA backward (for warmup).  Never called on the hot path."""
@@ -3086,7 +3100,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             NUM_RELAY=NUM_RELAY, BLOCK_RELAY=BLOCK_RELAY,
             BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
             BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
-            KV_GROUPS=1,
+            KV_GROUPS=1, TOP_K=TOP_K,
             num_warps=bwd_nw, num_stages=bwd_ns,
         )
         # local dK/dV
@@ -3135,28 +3149,29 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             S=S, D=D, SQRT_N=SQRT_N,
             NUM_RELAY=NUM_RELAY,
             BLOCK_Q=BLOCK_Q_RELAY, BLOCK_D=BLOCK_D,
+            TOP_K=TOP_K,
         )
         # relay scatter: d_relay_k/v → dK, dV
-        _relay_scatter_bwd[(B * H_q, NUM_RELAY)](
-            d_relay_k, dk, relay_w,
+        _relay_scatter_bwd_topk[(B * H_q, NUM_RELAY)](
+            d_relay_k, dk, relay_src,
             d_relay_k.stride(0), d_relay_k.stride(1), d_relay_k.stride(2), d_relay_k.stride(3),
             dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
-            relay_w.stride(0), relay_w.stride(1), relay_w.stride(2), relay_w.stride(3),
+            relay_src.stride(0), relay_src.stride(1), relay_src.stride(2),
             H_kv=H_q,
-            S=S, D=D, SQRT_N=SQRT_N, BLOCK_D=_BLOCK_D_RELAY,
+            D=D, BLOCK_D=_BLOCK_D_RELAY,
         )
-        _relay_scatter_bwd[(B * H_q, NUM_RELAY)](
-            d_relay_v, dv, relay_w,
+        _relay_scatter_bwd_topk[(B * H_q, NUM_RELAY)](
+            d_relay_v, dv, relay_src,
             d_relay_v.stride(0), d_relay_v.stride(1), d_relay_v.stride(2), d_relay_v.stride(3),
             dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
-            relay_w.stride(0), relay_w.stride(1), relay_w.stride(2), relay_w.stride(3),
+            relay_src.stride(0), relay_src.stride(1), relay_src.stride(2),
             H_kv=H_q,
-            S=S, D=D, SQRT_N=SQRT_N, BLOCK_D=_BLOCK_D_RELAY,
+            D=D, BLOCK_D=_BLOCK_D_RELAY,
         )
 
     @staticmethod
-    def _relay4_graphed(q, k, v, o, do, L, relay_k, relay_v, relay_w,
-                        S, D, SQRT_N, NUM_RELAY,
+    def _relay4_graphed(q, k, v, o, do, L, relay_k, relay_v, relay_src,
+                        S, D, SQRT_N, NUM_RELAY, TOP_K,
                         BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE, BLOCK_RELAY,
                         B, H_q):
         """Relay-4 MHA backward with CUDA graph replay after first-call JIT warmup.
@@ -3169,7 +3184,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
         so it does not need to be inside the captured graph.
         """
         cache = CronRootAttentionV14Function._relay4_graph_cache
-        cache_key = (B, H_q, S, D, NUM_RELAY,
+        cache_key = (B, H_q, S, D, NUM_RELAY, TOP_K,
                      BLOCK_M, BLOCK_D, BLOCK_STRIDE, BLOCK_LOCAL, BLOCK_RELAY,
                      q.device.index)
 
@@ -3182,7 +3197,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                 s_v       = v.clone();        s_o       = o.clone()
                 s_do      = do.clone();       s_L       = L.clone()
                 s_rk      = relay_k.clone();  s_rv      = relay_v.clone()
-                s_rw      = relay_w.clone()
+                s_rs      = relay_src.clone()
                 s_dq      = torch.empty_like(q)
                 s_dk      = torch.zeros_like(k)  # zeros: atomic accumulation in kernels
                 s_dv      = torch.zeros_like(v)
@@ -3191,9 +3206,9 @@ class CronRootAttentionV14Function(torch.autograd.Function):
 
                 _wup_stream.synchronize()
                 CronRootAttentionV14Function._relay4_launch(
-                    s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv, s_rw,
+                    s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv, s_rs,
                     s_dq, s_dk, s_dv, s_d_rk, s_d_rv,
-                    S, D, SQRT_N, NUM_RELAY,
+                    S, D, SQRT_N, NUM_RELAY, TOP_K,
                     BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE, BLOCK_RELAY, B, H_q)
                 _wup_stream.synchronize()
 
@@ -3206,22 +3221,22 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                     s_d_rk.zero_()
                     s_d_rv.zero_()
                     CronRootAttentionV14Function._relay4_launch(
-                        s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv, s_rw,
+                        s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv, s_rs,
                         s_dq, s_dk, s_dv, s_d_rk, s_d_rv,
-                        S, D, SQRT_N, NUM_RELAY,
+                        S, D, SQRT_N, NUM_RELAY, TOP_K,
                         BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE, BLOCK_RELAY, B, H_q)
             _cap_stream.synchronize()
 
-            cache[cache_key] = (g, s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv, s_rw,
+            cache[cache_key] = (g, s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv, s_rs,
                                 s_d_rk, s_d_rv, s_dq, s_dk, s_dv)
 
-        (g, s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv, s_rw,
+        (g, s_q, s_k, s_v, s_o, s_do, s_L, s_rk, s_rv, s_rs,
          s_d_rk, s_d_rv, s_dq, s_dk, s_dv) = cache[cache_key]
 
         with torch.cuda.stream(torch.cuda.default_stream(q.device)):
             s_q.copy_(q);   s_k.copy_(k);   s_v.copy_(v)
             s_o.copy_(o);   s_do.copy_(do); s_L.copy_(L)
-            s_rk.copy_(relay_k); s_rv.copy_(relay_v); s_rw.copy_(relay_w)
+            s_rk.copy_(relay_k); s_rv.copy_(relay_v); s_rs.copy_(relay_src)
             g.replay()
             # d_relay_log_scale is a tiny [H_q] reduction — compute in Python
             # after replay (not inside the graph) to keep graph code simple.
@@ -3235,7 +3250,8 @@ class CronRootAttentionV14Function(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                 use_persistent: bool = False, kv_groups: int = 1,
-                relay_log_scale: Optional[torch.Tensor] = None) -> torch.Tensor:
+                relay_log_scale: Optional[torch.Tensor] = None,
+                relay_top_k: int = 2) -> torch.Tensor:
         B, H_q, S, D = q.shape
         H_kv = k.shape[1]  # H_q // kv_groups (or H_q when kv_groups==1)
         SQRT_N = int(math.ceil(math.sqrt(S)))
@@ -3271,28 +3287,28 @@ class CronRootAttentionV14Function(torch.autograd.Function):
         if skip_relay:
             NUM_RELAY = 0
             # Dummy relay buffers (never accessed since NUM_RELAY=0)
-            relay_k = torch.empty(B, H_kv, 1, D, device=q.device, dtype=q.dtype)
-            relay_v = torch.empty(B, H_kv, 1, D, device=q.device, dtype=q.dtype)
-            relay_w = torch.empty(B, H_kv, 1, 1, device=q.device, dtype=q.dtype)
+            relay_k   = torch.empty(B, H_kv, 1, D, device=q.device, dtype=q.dtype)
+            relay_v   = torch.empty(B, H_kv, 1, D, device=q.device, dtype=q.dtype)
+            relay_src = torch.empty(B, H_kv, 1, dtype=torch.float32, device=q.device)
         else:
-            # Norm²-weighted relay pre-computation via fused Triton kernel.
-            # relay_k[r] = Σ wᵢ·Kᵢ  (not mean(K)), giving higher fidelity:
-            # tokens with high ‖Kᵢ‖² dominate the block representative.
-            NUM_RELAY = (S + SQRT_N - 1) // SQRT_N
-            relay_k = torch.empty(B, H_kv, NUM_RELAY, D, device=k.device, dtype=k.dtype)
-            relay_v = torch.empty(B, H_kv, NUM_RELAY, D, device=k.device, dtype=k.dtype)
-            # relay_w[b, h, r, i] = w_i used in forward; saved for backward scatter.
-            relay_w = torch.empty(B, H_kv, NUM_RELAY, SQRT_N, device=k.device, dtype=k.dtype)
+            # Top-K exact-token relay: select the relay_top_k highest-‖k‖² tokens
+            # per √N block as exact relay representatives (no blurring).
+            NUM_RELAY_BLOCKS = (S + SQRT_N - 1) // SQRT_N
+            NUM_RELAY = NUM_RELAY_BLOCKS * relay_top_k
+            relay_k   = torch.empty(B, H_kv, NUM_RELAY, D, device=k.device, dtype=k.dtype)
+            relay_v   = torch.empty(B, H_kv, NUM_RELAY, D, device=k.device, dtype=k.dtype)
+            # relay_src[b, h, t] = float32 source position for relay token t.
+            relay_src = torch.empty(B, H_kv, NUM_RELAY, dtype=torch.float32, device=k.device)
             _BLOCK_D_RELAY = triton.next_power_of_2(D)
-            _relay_precompute_fwd[(B * H_kv, NUM_RELAY)](
-                k, v, relay_k, relay_v, relay_w,
+            _relay_precompute_topk[(B * H_kv, NUM_RELAY_BLOCKS)](
+                k, v, relay_k, relay_v, relay_src,
                 k.stride(0), k.stride(1), k.stride(2), k.stride(3),
                 v.stride(0), v.stride(1), v.stride(2), v.stride(3),
                 relay_k.stride(0), relay_k.stride(1), relay_k.stride(2), relay_k.stride(3),
                 relay_v.stride(0), relay_v.stride(1), relay_v.stride(2), relay_v.stride(3),
-                relay_w.stride(0), relay_w.stride(1), relay_w.stride(2), relay_w.stride(3),
+                relay_src.stride(0), relay_src.stride(1), relay_src.stride(2),
                 H_kv=H_kv,
-                S=S, D=D, SQRT_N=SQRT_N, BLOCK_D=_BLOCK_D_RELAY,
+                S=S, D=D, SQRT_N=SQRT_N, TOP_K=relay_top_k, BLOCK_D=_BLOCK_D_RELAY,
             )
         
         # Apply learnable per-head relay scale: relay_k *= exp(relay_log_scale[h]),
@@ -3358,10 +3374,11 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                 BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
                 BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
                 KV_GROUPS=kv_groups,
+                TOP_K=relay_top_k,
                 num_warps=fwd_nw, num_stages=fwd_ns,
             )
         
-        ctx.save_for_backward(q, k, v, o, L, relay_k, relay_v, relay_w)
+        ctx.save_for_backward(q, k, v, o, L, relay_k, relay_v, relay_src)
         ctx.SQRT_N = SQRT_N
         ctx.NUM_RELAY = NUM_RELAY
         ctx.skip_relay = skip_relay
@@ -3371,12 +3388,13 @@ class CronRootAttentionV14Function(torch.autograd.Function):
         ctx.BLOCK_STRIDE = BLOCK_STRIDE
         ctx.BLOCK_RELAY = BLOCK_RELAY
         ctx.kv_groups = kv_groups
+        ctx.relay_top_k = relay_top_k
         
         return o
     
     @staticmethod
     def backward(ctx, do: torch.Tensor):
-        q, k, v, o, L, relay_k, relay_v, relay_w = ctx.saved_tensors
+        q, k, v, o, L, relay_k, relay_v, relay_src = ctx.saved_tensors
         # NOTE: do NOT call torch.cuda.set_device(q.device) here.  It is a
         # non-context-manager call that permanently changes the global current
         # device, poisoning downstream TE/FP8 CUBLAS workspace references and
@@ -3402,6 +3420,7 @@ class CronRootAttentionV14Function(torch.autograd.Function):
         # so dp[:, padded] = 0 and k[padded, :] = 0 → zero contribution to dq.
         BLOCK_STRIDE = max(BLOCK_STRIDE, 16)
         BLOCK_RELAY = ctx.BLOCK_RELAY
+        relay_top_k = ctx.relay_top_k
         
         use_fused_bwd = (S <= CronRootAttentionV14Function.FUSED_BWD_THRESHOLD)
         
@@ -3482,13 +3501,13 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             (dq, dk, dv,
              d_relay_k, d_relay_v,
              _d_rls_raw) = CronRootAttentionV14Function._relay4_graphed(
-                q, k, v, o, do, L, relay_k, relay_v, relay_w,
-                S, D, SQRT_N, NUM_RELAY,
+                q, k, v, o, do, L, relay_k, relay_v, relay_src,
+                S, D, SQRT_N, NUM_RELAY, relay_top_k,
                 BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE, BLOCK_RELAY, B, H_q)
             if ctx.relay_log_scale is not None:
                 d_relay_log_scale = _d_rls_raw.to(ctx.relay_log_scale.dtype)
 
-        return dq, dk, dv, None, None, d_relay_log_scale  # extra None for use_persistent, kv_groups; d_relay_log_scale for relay_log_scale arg  # extra None for use_persistent, kv_groups; d_relay_log_scale for relay_log_scale arg
+        return dq, dk, dv, None, None, d_relay_log_scale, None  # Nones: use_persistent, kv_groups, relay_log_scale, relay_top_k
 
 
 # Tell torch.compile (Dynamo) to graph-break at the CronRoot boundary.
@@ -3499,7 +3518,8 @@ class CronRootAttentionV14Function(torch.autograd.Function):
 @torch.compiler.disable
 def cron_root_attention_v14(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                        use_persistent: bool = False, kv_groups: int = 1,
-                       relay_log_scale: Optional[torch.Tensor] = None) -> torch.Tensor:
+                       relay_log_scale: Optional[torch.Tensor] = None,
+                       relay_top_k: int = 2) -> torch.Tensor:
     """
     V14 Tiled Cron Root Attention with optional GQA support.
     
@@ -3525,7 +3545,7 @@ def cron_root_attention_v14(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     if q.device.type == 'cpu':
         from .cpu_reference import cra_cpu_fast_compiled
         return cra_cpu_fast_compiled(q, k, v)
-    return CronRootAttentionV14Function.apply(q, k, v, use_persistent, kv_groups, relay_log_scale)
+    return CronRootAttentionV14Function.apply(q, k, v, use_persistent, kv_groups, relay_log_scale, relay_top_k)
 
 
 class CronRootAttentionV14(nn.Module):
