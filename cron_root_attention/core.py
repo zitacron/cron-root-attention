@@ -341,7 +341,7 @@ class _KernelAutoTuner:
         bench_S = max(S, self._MIN_BENCH_S)
         if bench_S != S:
             bench_SQRT_N = int(math.ceil(math.sqrt(bench_S)))
-            bench_NUM_RELAY = (bench_S + bench_SQRT_N - 1) // bench_SQRT_N
+            bench_NUM_RELAY = (bench_S + bench_SQRT_N - 1) // bench_SQRT_N * 2  # TOP_K=2 for bench
             bench_q = torch.randn(1, H_q, bench_S, D, device=q.device, dtype=q.dtype)
             bench_k = torch.randn(1, H_q, bench_S, D, device=q.device, dtype=q.dtype)
             bench_v = torch.randn(1, H_q, bench_S, D, device=q.device, dtype=q.dtype)
@@ -2691,18 +2691,23 @@ def _relay_scatter_bwd_topk(
     stride_dkvb, stride_dkvh, stride_dkvs, stride_dkvd,
     stride_rsb, stride_rsh, stride_rst,
     H_kv,
-    D: tl.constexpr, BLOCK_D: tl.constexpr,
+    D: tl.constexpr, TOP_K: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
     """
     Top-K relay scatter backward.
 
-    Grid: (B * H_kv, NUM_RELAY_FLAT)
-    Each program owns one relay token t, loads its source position from
-    relay_src[b, h, t], and atomically accumulates d_relay[b, h, t, :]
-    into d_kv[b, h, src_pos, :].
+    Grid: (B * H_kv, NUM_RELAY_BLOCKS)
+    Each program owns one relay BLOCK (all TOP_K representative tokens).
+    All TOP_K source positions lie within [r*SQRT_N, (r+1)*SQRT_N), which is
+    exclusive to this program — no other relay scatter program writes there.
+    So plain load+add+store is correct; zero atomics.
+
+    Degenerate last partial block (src0 == src1 when block has <2 valid tokens):
+    handled naturally — iteration j=1 re-loads the value j=0 already wrote and
+    adds its own gradient on top.  Correct because the loop is sequential.
     """
     bh = tl.program_id(0)
-    t  = tl.program_id(1)
+    r  = tl.program_id(1)   # relay block index (NOT flat token index)
 
     b = bh // H_kv
     h = bh %  H_kv
@@ -2710,17 +2715,24 @@ def _relay_scatter_bwd_topk(
     d_idx  = tl.arange(0, BLOCK_D)
     d_mask = d_idx < D
 
-    # Load gradient for this relay token [D]
-    dr_ptr = d_relay + b * stride_drb + h * stride_drh + t * stride_drt
-    dr = tl.load(dr_ptr + d_idx * stride_drd, mask=d_mask, other=0.0)
+    dkv_base = d_kv + b * stride_dkvb + h * stride_dkvh
 
-    # Source position stored as float32 (exact for integers up to 2^24)
-    src_f   = tl.load(relay_src + b * stride_rsb + h * stride_rsh + t * stride_rst)
-    src_pos = src_f.to(tl.int32)
+    for j in tl.static_range(TOP_K):
+        t = r * TOP_K + j
 
-    # Scatter gradient to the exact source row (atomic for safety on partial blocks)
-    dkv_ptr = d_kv + b * stride_dkvb + h * stride_dkvh + src_pos * stride_dkvs
-    tl.atomic_add(dkv_ptr + d_idx * stride_dkvd, dr.to(d_kv.dtype.element_ty), mask=d_mask)
+        # Load gradient for this relay token [D]
+        dr_ptr = d_relay + b * stride_drb + h * stride_drh + t * stride_drt
+        dr = tl.load(dr_ptr + d_idx * stride_drd, mask=d_mask, other=0.0)
+
+        # Source position stored as float32 (exact for integers up to 2^24)
+        src_f   = tl.load(relay_src + b * stride_rsb + h * stride_rsh + t * stride_rst)
+        src_pos = src_f.to(tl.int32)
+
+        # Scatter: read-add-write.  No atomics: exclusive block ownership.
+        dkv_ptr = dkv_base + src_pos * stride_dkvs
+        cur = tl.load(dkv_ptr + d_idx * stride_dkvd, mask=d_mask, other=0.0)
+        tl.store(dkv_ptr + d_idx * stride_dkvd,
+                 (cur + dr).to(d_kv.dtype.element_ty), mask=d_mask)
 
 
 # =============================================================================
@@ -3152,21 +3164,25 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             TOP_K=TOP_K,
         )
         # relay scatter: d_relay_k/v → dK, dV
-        _relay_scatter_bwd_topk[(B * H_q, NUM_RELAY)](
+        # Grid uses NUM_RELAY_BLOCKS (not NUM_RELAY), since each program owns
+        # one block (TOP_K relay tokens) and loops over them sequentially —
+        # exclusive block ownership means zero atomics.
+        NUM_RELAY_BLOCKS_SCATTER = NUM_RELAY // TOP_K
+        _relay_scatter_bwd_topk[(B * H_q, NUM_RELAY_BLOCKS_SCATTER)](
             d_relay_k, dk, relay_src,
             d_relay_k.stride(0), d_relay_k.stride(1), d_relay_k.stride(2), d_relay_k.stride(3),
             dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
             relay_src.stride(0), relay_src.stride(1), relay_src.stride(2),
             H_kv=H_q,
-            D=D, BLOCK_D=_BLOCK_D_RELAY,
+            D=D, TOP_K=TOP_K, BLOCK_D=_BLOCK_D_RELAY,
         )
-        _relay_scatter_bwd_topk[(B * H_q, NUM_RELAY)](
+        _relay_scatter_bwd_topk[(B * H_q, NUM_RELAY_BLOCKS_SCATTER)](
             d_relay_v, dv, relay_src,
             d_relay_v.stride(0), d_relay_v.stride(1), d_relay_v.stride(2), d_relay_v.stride(3),
             dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
             relay_src.stride(0), relay_src.stride(1), relay_src.stride(2),
             H_kv=H_q,
-            D=D, BLOCK_D=_BLOCK_D_RELAY,
+            D=D, TOP_K=TOP_K, BLOCK_D=_BLOCK_D_RELAY,
         )
 
     @staticmethod

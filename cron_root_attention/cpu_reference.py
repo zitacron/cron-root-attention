@@ -247,22 +247,36 @@ def cra_cpu_fast(
     K_s = k[:, :, stride_idx, :].contiguous()
     V_s = v[:, :, stride_idx, :].contiguous()
 
-    # ── Phase 3: relay (block-mean) keys ──────────────────────────────────────
+    # ── Phase 3: relay (top-K exact-token) keys ───────────────────────────────
     if use_relay:
         NB   = (T + sqrt_n - 1) // sqrt_n
         pad  = NB * sqrt_n - T
         kp   = F.pad(k, (0, 0, 0, pad)) if pad > 0 else k
         vp   = F.pad(v, (0, 0, 0, pad)) if pad > 0 else v
-        K_rl = kp.view(B, H_q, NB, sqrt_n, d).mean(dim=3).contiguous()
-        V_rl = vp.view(B, H_q, NB, sqrt_n, d).mean(dim=3).contiguous()
+        # [B, H_q, NB, sqrt_n, d]
+        k_blocks = kp.view(B, H_q, NB, sqrt_n, d)
+        v_blocks = vp.view(B, H_q, NB, sqrt_n, d)
+        # Top-2 by ‖k‖² per block → exact representative tokens
+        TOP_K = 2
+        norms_sq = (k_blocks * k_blocks).sum(dim=-1)         # [B, H_q, NB, sqrt_n]
+        topk_idx = norms_sq.topk(min(TOP_K, sqrt_n), dim=-1).indices  # [B, H_q, NB, K]
+        idx_exp  = topk_idx.unsqueeze(-1).expand(*topk_idx.shape, d)
+        K_rl = k_blocks.gather(3, idx_exp).reshape(B, H_q, NB * TOP_K, d).contiguous()
+        V_rl = v_blocks.gather(3, idx_exp).reshape(B, H_q, NB * TOP_K, d).contiguous()
         K_23 = torch.cat([K_s, K_rl], dim=2).contiguous()
         V_23 = torch.cat([V_s, V_rl], dim=2).contiguous()
-        SNB  = S + NB
+        SNB  = S + NB * TOP_K
     else:
         K_23 = K_s; V_23 = V_s; SNB = S; NB = 0
 
     # Pre-compute causal masks for Phase-2+3 (shape broadcast constants, cheap)
-    b_ends = (torch.arange(NB, device=dev) + 1) * sqrt_n - 1 if use_relay else None
+    # Relay token t belongs to block t // TOP_K; block_end = (t//TOP_K + 1)*sqrt_n - 1
+    if use_relay:
+        NB_FLAT = NB * TOP_K
+        t_idx_relay = torch.arange(NB_FLAT, device=dev)
+        b_ends = ((t_idx_relay // TOP_K) + 1) * sqrt_n - 1
+    else:
+        b_ends = None
 
     K_23_bh  = K_23.reshape(BH, SNB, d)                          # L1-hot (~1.4 MB)
     V_23_bh  = V_23.reshape(BH, SNB, d)
