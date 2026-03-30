@@ -306,32 +306,37 @@ def bench_kernels(
     Pure attention fwd+bwd timing with CUDA events — directly comparable to README.
     No MLP, no optimizer, no Python overhead. Returns dict[(backend, seq_len)] -> ms.
 
+    Also runs a forward-only pass at each S to show the raw algorithmic speedup
+    (inference mode — no autograd, no backward kernels).
+
     silent=True suppresses all output (used when called purely for attn% calculation).
     """
     head_dim = d_model // n_heads
     if not silent:
         print(f"\n{'='*72}")
         print(f"KERNEL SPEED BENCHMARK  (H={n_heads}x D={head_dim} = {d_model}-dim, B={batch_size})")
-        print(f"  fwd+bwd, CUDA events, {n_repeats} repeats, 10% trimmed mean")
-        print(f"  Isolates ONLY the attention kernel — directly matches README numbers.")
+        print(f"  fwd+bwd: training mode.  fwd-only: inference mode (no autograd).")
+        print(f"  CRA is O(N\u221aN) vs SDPA O(N\u00b2): advantage grows with sequence length.")
+        print(f"  CUDA events, {n_repeats} repeats, 10% trimmed mean.")
         print(f"{'='*72}")
-        print(f"  {'S':>7}  {'Backend':<8}  {'Fwd+Bwd ms':>12}  {'vs SDPA':>10}")
-        print(f"  {'-'*46}")
+        print(f"  {'S':>7}  {'Backend':<8}  {'Fwd+Bwd ms':>12}  {'vs SDPA':>8}"
+              f"  {'Fwd-only ms':>12}  {'vs SDPA':>8}")
+        print(f"  {'-'*62}")
 
     from cron_root_attention import cron_root_attention
 
-    def _timed(fn) -> float:
-        for _ in range(max(5, n_repeats // 4)):
+    def _timed(fn, reps: int) -> float:
+        for _ in range(max(5, reps // 4)):
             fn()
         torch.cuda.synchronize()
-        ev_s = [torch.cuda.Event(enable_timing=True) for _ in range(n_repeats)]
-        ev_e = [torch.cuda.Event(enable_timing=True) for _ in range(n_repeats)]
-        for i in range(n_repeats):
+        ev_s = [torch.cuda.Event(enable_timing=True) for _ in range(reps)]
+        ev_e = [torch.cuda.Event(enable_timing=True) for _ in range(reps)]
+        for i in range(reps):
             ev_s[i].record()
             fn()
             ev_e[i].record()
         torch.cuda.synchronize()
-        times = sorted(ev_s[i].elapsed_time(ev_e[i]) for i in range(n_repeats))
+        times = sorted(ev_s[i].elapsed_time(ev_e[i]) for i in range(reps))
         trim = max(1, len(times) // 10)
         t = times[trim:-trim] if len(times) > 2 * trim else times
         return sum(t) / len(t)
@@ -341,12 +346,15 @@ def bench_kernels(
 
     for seq_len in seq_lens:
         ref_ms: Optional[float] = None
+        ref_fwd_ms: Optional[float] = None
         row: Dict[str, Optional[float]] = {}
+        row_fwd: Dict[str, Optional[float]] = {}
 
         for backend in ordered:
             gc.collect()
             torch.cuda.empty_cache()
             try:
+                # ── Fwd+bwd ──────────────────────────────────────────────────
                 q = torch.randn(batch_size, n_heads, seq_len, head_dim,
                                 device=device, dtype=torch.float16, requires_grad=True)
                 k = torch.randn_like(q)
@@ -363,31 +371,81 @@ def bench_kernels(
                         o.sum().backward()
                         q.grad = k.grad = v.grad = None
 
-                ms = _timed(_fn)
+                ms = _timed(_fn, n_repeats)
                 row[backend] = ms
                 results[(backend, seq_len)] = ms
                 if backend == "sdpa":
                     ref_ms = ms
-                del q, k, v
+
+                # ── Forward-only (inference mode, no autograd) ────────────────
+                q_inf = torch.randn(batch_size, n_heads, seq_len, head_dim,
+                                    device=device, dtype=torch.float16)
+                k_inf = torch.randn_like(q_inf)
+                v_inf = torch.randn_like(q_inf)
+
+                if backend == "sdpa":
+                    def _fwd_fn():
+                        with torch.no_grad():
+                            F.scaled_dot_product_attention(q_inf, k_inf, v_inf, is_causal=True)
+                else:
+                    def _fwd_fn():
+                        with torch.no_grad():
+                            cron_root_attention(q_inf, k_inf, v_inf)
+
+                fwd_ms = _timed(_fwd_fn, n_repeats)
+                row_fwd[backend] = fwd_ms
+                if backend == "sdpa":
+                    ref_fwd_ms = fwd_ms
+
+                del q, k, v, q_inf, k_inf, v_inf
                 torch.cuda.empty_cache()
             except Exception as e:
                 row[backend] = None
+                row_fwd[backend] = None
                 if not silent:
                     print(f"  {seq_len:>7}  {backend:<8}  ERROR: {e}")
 
         if not silent:
             for backend in ordered:
-                ms = row.get(backend)
-                if ms is None:
+                fb_ms = row.get(backend)
+                fw_ms = row_fwd.get(backend)
+                if fb_ms is None:
                     continue
+                # Fwd+bwd columns
                 if backend == "sdpa" or ref_ms is None:
-                    vs_str = "baseline"
-                    flag = ""
+                    fb_str = "baseline"
+                    fb_flag = ""
                 else:
-                    ratio = ref_ms / ms
-                    vs_str = f"{ratio:.2f}x"
-                    flag = "  ◀ FASTER" if ms < ref_ms else "  (slower)"
-                print(f"  {seq_len:>7}  {backend:<8}  {ms:>11.3f}ms  {vs_str:>10}{flag}")
+                    r = ref_ms / fb_ms
+                    fb_str = f"{r:.2f}x"
+                    if fb_ms < ref_ms:
+                        fb_flag = "◀"
+                        if r >= 10.0:
+                            fb_flag = f"★{r:.0f}x"
+                        elif r >= 5.0:
+                            fb_flag = f"★{r:.1f}x"
+                    else:
+                        fb_flag = "(slow)"
+                # Fwd-only columns
+                if fw_ms is not None and backend != "sdpa" and ref_fwd_ms is not None:
+                    r2 = ref_fwd_ms / fw_ms
+                    fw_str = f"{fw_ms:.3f}ms"
+                    if fw_ms < ref_fwd_ms:
+                        fw_flag = f"{r2:.2f}x ◀"
+                        if r2 >= 10.0:
+                            fw_flag = f"{r2:.1f}x ★"
+                        elif r2 >= 5.0:
+                            fw_flag = f"{r2:.1f}x ★"
+                    else:
+                        fw_flag = f"{r2:.2f}x"
+                elif backend == "sdpa" and fw_ms is not None:
+                    fw_str = f"{fw_ms:.3f}ms"
+                    fw_flag = "baseline"
+                else:
+                    fw_str = "—"
+                    fw_flag = ""
+                print(f"  {seq_len:>7}  {backend:<8}  {fb_ms:>11.3f}ms  {fb_str:>8}"
+                      f"  {fw_str:>12}  {fw_flag}")
 
     return results
 
@@ -566,6 +624,15 @@ def main() -> None:
                         help="Skip isolated kernel speed benchmark")
     parser.add_argument("--kernel_repeats",  type=int, default=30,
                         help="Timed repeats for kernel benchmark (trimmed mean)")
+    parser.add_argument("--kernel_seq_lens", type=int, nargs="+",
+                        default=[1024, 2048, 4096, 8192, 16384, 32768, 65536],
+                        help="Sequence lengths for the KERNEL-ONLY benchmark. "
+                             "Defaults to a wide range covering both sides of "
+                             "the O(N√N) crossover point. Training tasks still "
+                             "use --seq_lens (short sequences for fast iteration). "
+                             "Use --kernel_seq_lens 1024 2048 4096 to test only "
+                             "short sequences, or go up to 131072 for the full "
+                             "O(N√N) vs O(N²) scaling story.")
     parser.add_argument("--seed",            type=int, default=42)
     args = parser.parse_args()
 
@@ -597,17 +664,20 @@ def main() -> None:
     kernel_times: Dict = {}
     kernel_times_train: Dict = {}
     if not args.no_kernel_bench and device != "cpu":
-        # B=1 run for README-comparable numbers (displayed)
+        # B=1 run — wide S range so the full O(N√N) advantage is visible.
+        # kernel_seq_lens defaults to [1K..65K]; --seq_lens controls training only.
+        # Scale repeats down at large S to keep runtime reasonable.
+        kern_reps = args.kernel_repeats
         kernel_times = bench_kernels(
             d_model=args.d_model,
             n_heads=args.n_heads,
-            seq_lens=args.seq_lens,
+            seq_lens=args.kernel_seq_lens,
             backends=args.backends,
             batch_size=1,
             device=device,
-            n_repeats=args.kernel_repeats,
+            n_repeats=kern_reps,
         )
-        # B=batch_size run for accurate attn% fraction (silent)
+        # B=batch_size run for accurate attn% fraction — only at training seq_lens.
         kernel_times_train = bench_kernels(
             d_model=args.d_model,
             n_heads=args.n_heads,

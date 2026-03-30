@@ -171,15 +171,21 @@ def get_num_sms() -> int:
           f"Consider adding to GPU_SM_MAP for optimal performance.")
     return 48
 
-# Dynamic SM count (cached after first call)
-NUM_SMS = None  # Lazy initialization
+# Dynamic SM count — cached per device index so multi-GPU setups get the
+# correct SM count even after torch.cuda.set_device() calls.
+_NUM_SMS_CACHE: dict = {}  # { device_index: sm_count }
 
 def _get_num_sms():
-    """Lazily get SM count to avoid CUDA initialization at import time."""
-    global NUM_SMS
-    if NUM_SMS is None:
-        NUM_SMS = get_num_sms()
-    return NUM_SMS
+    """Get SM count for the CURRENT CUDA device, cached per device index.
+
+    Caching per-device (not globally) avoids the silent error where a
+    multi-GPU system runs the persistent kernel with the wrong grid size
+    after a device switch.
+    """
+    device = torch.cuda.current_device()
+    if device not in _NUM_SMS_CACHE:
+        _NUM_SMS_CACHE[device] = get_num_sms()
+    return _NUM_SMS_CACHE[device]
 
 # =============================================================================
 # BLACKWELL (SM 12.0) KERNEL CONFIGURATION
@@ -275,8 +281,21 @@ class _KernelAutoTuner:
         if torch.cuda.is_available():
             prop = torch.cuda.get_device_properties(torch.cuda.current_device())
             self._gpu_tag_str = f"sm{prop.major}{prop.minor}_{prop.name.replace(' ', '_')}"
+            sm = prop.major * 10 + prop.minor
         else:
             self._gpu_tag_str = "cpu"
+            sm = 0
+        # GPU-adaptive candidate set.  (8, 3) requests 3 pipeline stages which
+        # can silently overflow shared memory on Turing/Ampere (48-96 KB) and
+        # produce wrong gradients. Only allow it on Hopper/Blackwell (SM 9.0+)
+        # which have 192+ KB shared memory per SM.
+        # (8, 2) is safe on Ampere (SM 8.x) which has 96-164 KB with opt-in.
+        if sm >= 90:   # Hopper (9.0), Blackwell (12.0)
+            self.CANDIDATES = [(4, 1), (4, 2), (8, 2), (8, 3)]
+        elif sm >= 80:  # Ampere: A100, RTX 30xx
+            self.CANDIDATES = [(4, 1), (4, 2), (8, 2)]
+        else:           # Turing (7.5), Volta (7.0), older — conservative
+            self.CANDIDATES = [(4, 1), (4, 2)]
 
     # ── Persistence ───────────────────────────────────────────────────
     def _load_cache(self):
@@ -2796,12 +2815,18 @@ class CronRootAttentionV14Function(torch.autograd.Function):
         """Raw 3-kernel split3 backward (no Python-overhead mitigation).
         Used for warmup inside _split3_graphed; never called on the hot path."""
         num_tiles_m     = (S + BLOCK_M - 1) // BLOCK_M
-        BLOCK_N, BLOCK_Q = 32, 32
+        # BLOCK_Q=64 doubles arithmetic intensity vs 32: each key-tile block
+        # owns 64 queries instead of 32, halving the number of times K/V tiles
+        # are loaded and issued to tensor cores. SRAM budget at BLOCK_Q=64:
+        # 3×64×64×2 (Q/O/dO) + 2×32×64×2 (K/V) + 64×32×4 (scores/dp) = 36KB
+        # — well within the 99KB L1 on all GPUs (even Turing's 48KB).
+        BLOCK_N, BLOCK_Q = 32, 64
         num_tiles_n     = (S + BLOCK_N - 1) // BLOCK_N
         num_strided     = (S + SQRT_N - 1) // SQRT_N
         BLOCK_Q_STRIDED = 64
-        # Select NUM_Q_TILES: parallelize the O(N) query loop across tiles
-        NUM_Q_TILES_STRIDED = 1 if S <= 256 else (2 if S <= 512 else 4)
+        # Select NUM_Q_TILES: parallelize the O(N) query loop across tiles.
+        # At S>8192 use 8 tiles for better SM occupancy (double the grid size).
+        NUM_Q_TILES_STRIDED = 1 if S <= 256 else (2 if S <= 512 else (4 if S <= 8192 else 8))
 
         # Inline auto-tune: first backward per (H, D) benchmarks dQ kernel
         if not _tuner.is_tuned("bwd", H_q, D):
@@ -2970,12 +2995,13 @@ class CronRootAttentionV14Function(torch.autograd.Function):
         """Raw 3-kernel GQA split3 backward (KV-head-centric dK/dV kernels).
         Used for warmup inside _split3_graphed_gqa; never called on the hot path."""
         num_tiles_m      = (S + BLOCK_M - 1) // BLOCK_M
-        BLOCK_N, BLOCK_Q = 32, 32
+        # Same BLOCK_Q=64 upgrade as in _split3_launch (see comment there).
+        BLOCK_N, BLOCK_Q = 32, 64
         num_kv_tiles     = (S + BLOCK_N - 1) // BLOCK_N
         num_strided      = (S + SQRT_N - 1) // SQRT_N
         BLOCK_Q_STRIDED  = 64
-        # Select NUM_Q_TILES: parallelize the O(N) query loop across tiles
-        NUM_Q_TILES_STRIDED = 1 if S <= 256 else (2 if S <= 512 else 4)
+        # Select NUM_Q_TILES: parallelize the O(N) query loop across tiles.
+        NUM_Q_TILES_STRIDED = 1 if S <= 256 else (2 if S <= 512 else (4 if S <= 8192 else 8))
 
         # Reuse cached bwd config (tuned by split3 MHA or tune_bwd_inline)
         bwd_nw, bwd_ns = _tuner.get_config("bwd", H_q, D)
