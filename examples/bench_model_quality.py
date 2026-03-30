@@ -459,14 +459,15 @@ def train_task(
         _jit_warmup(model, seq_len, batch_size, device)
 
     if compile_model and device != "cpu":
-        compile_mode = "default" if backend in ("cra", "hybrid") else "reduce-overhead"
+        compile_mode = "reduce-overhead"  # works for all backends: @torch.compiler.disable
+        # creates graph breaks at CRA boundaries, and reduce-overhead captures
+        # each subgraph (MLP, LN, projections) independently as CUDA graphs.
         model = torch.compile(model, mode=compile_mode)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=n_steps, eta_min=lr * 0.1
     )
-    scaler = torch.amp.GradScaler("cuda")
 
     perm = torch.randperm(n_train, device=device)
     perm_pos = 0
@@ -481,7 +482,7 @@ def train_task(
         return train_seqs[idx], train_tgts[idx]
 
     t0 = time.time()
-    recent_losses: List[float] = []
+    recent_losses: List[torch.Tensor] = []  # hold detached tensors, .item() at report time
     val_acc = 0.0
 
     for step in range(1, n_steps + 1):
@@ -494,17 +495,18 @@ def train_task(
             )
 
         optimizer.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
+        # BF16 has FP32-equivalent exponent range — GradScaler is unnecessary and
+        # adds per-step overhead (unscale_ kernel launches + inf-check GPU sync).
+        loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(optimizer)
-        scaler.update()
+        optimizer.step()
         scheduler.step()
-        recent_losses.append(loss.item())
+        # detach() avoids a per-step CPU–GPU sync; .item() fires once per report.
+        recent_losses.append(loss.detach())
 
         if step % 200 == 0 or step == n_steps:
             val_acc = _validate(model, val_seqs, val_tgts, batch_size)
-            smooth = sum(recent_losses[-50:]) / len(recent_losses[-50:])
+            smooth = torch.stack(recent_losses[-50:]).float().mean().item()
             print(
                 f"  step {step:4d}/{n_steps}"
                 f"  loss={smooth:.4f}"

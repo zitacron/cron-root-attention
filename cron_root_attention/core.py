@@ -263,11 +263,20 @@ class _KernelAutoTuner:
     def __init__(self):
         self._cache: dict[str, tuple[int, int]] = {}
         self._lock = threading.Lock()
+        # Fast-path lookup: (op, H, D) → (nw, ns), no GPU API call, no lock.
+        # Populated after first tune or on first get_config hit.
+        self._fast: dict[tuple[str, int, int], tuple[int, int]] = {}
         self._cache_file = os.path.join(
             os.path.expanduser("~"), ".cache", "cron_root_attention",
             "autotune_v14.json"
         )
         self._load_cache()
+        # Cache GPU tag once at init — GPU never changes at runtime.
+        if torch.cuda.is_available():
+            prop = torch.cuda.get_device_properties(torch.cuda.current_device())
+            self._gpu_tag_str = f"sm{prop.major}{prop.minor}_{prop.name.replace(' ', '_')}"
+        else:
+            self._gpu_tag_str = "cpu"
 
     # ── Persistence ───────────────────────────────────────────────────
     def _load_cache(self):
@@ -288,33 +297,46 @@ class _KernelAutoTuner:
             pass
 
     # ── Key construction ──────────────────────────────────────────────
-    @staticmethod
-    def _gpu_tag() -> str:
-        if not torch.cuda.is_available():
-            return "cpu"
-        prop = torch.cuda.get_device_properties(torch.cuda.current_device())
-        return f"sm{prop.major}{prop.minor}_{prop.name.replace(' ', '_')}"
+    def _gpu_tag(self) -> str:
+        return self._gpu_tag_str
 
     def _cache_key(self, op: str, H: int, D: int) -> str:
         """Key by (GPU, op, H, D) only — optimal config is S-independent."""
-        return f"{self._gpu_tag()}|{op}|H{H}|D{D}"
+        return f"{self._gpu_tag_str}|{op}|H{H}|D{D}"
 
     # ── Lookup (zero overhead on hot path) ────────────────────────────
     def get_config(self, op: str, H: int, D: int) -> tuple[int, int]:
-        """Return the cached (num_warps, num_stages) or static default."""
-        key = self._cache_key(op, H, D)
-        with self._lock:
-            hit = self._cache.get(key)
+        """Return the cached (num_warps, num_stages) or static default.
+
+        Fast path: single dict lookup, no CUDA API call, no lock.
+        Slow path (first call): falls back to string-keyed cache + lock.
+        """
+        fast_key = (op, H, D)
+        hit = self._fast.get(fast_key)
         if hit is not None:
             return hit
-        # Not yet tuned: return static default.  The next section
-        # (_tune_fwd_inline / _tune_bwd_inline) will tune on first call.
-        return (_KW, _KS_FWD) if op == "fwd" else (_KW, _KS)
+        # Slow path: first time this (op, H, D) is queried.
+        full_key = self._cache_key(op, H, D)
+        with self._lock:
+            result = self._cache.get(full_key)
+        if result is None:
+            result = (_KW, _KS_FWD) if op == "fwd" else (_KW, _KS)
+        self._fast[fast_key] = result
+        return result
 
     def is_tuned(self, op: str, H: int, D: int) -> bool:
-        key = self._cache_key(op, H, D)
+        # Fast path: if already in _fast dict, it was tuned.
+        fast_key = (op, H, D)
+        if fast_key in self._fast:
+            return True
+        full_key = self._cache_key(op, H, D)
         with self._lock:
-            return key in self._cache
+            result = full_key in self._cache
+        if result:
+            # Prime fast path so future get_config avoids the lock.
+            with self._lock:
+                self._fast[fast_key] = self._cache[full_key]
+        return result
 
     # Minimum S for benchmarking — below this, kernel time is <0.1ms and
     # measurement noise dominates, causing random config selection.
@@ -417,6 +439,7 @@ class _KernelAutoTuner:
         with self._lock:
             self._cache[key] = best_cfg
             self._save_cache()
+        self._fast[("fwd", H_q, D)] = best_cfg
         return best_cfg
 
     # ── Inline backward auto-tune ─────────────────────────────────────
@@ -464,6 +487,7 @@ class _KernelAutoTuner:
         with self._lock:
             self._cache[key] = best_cfg
             self._save_cache()
+        self._fast[("bwd", H, D)] = best_cfg
         return best_cfg
 
     def _tune_bwd_synthetic(self, H: int, D: int,
@@ -534,12 +558,14 @@ class _KernelAutoTuner:
         with self._lock:
             self._cache[self._cache_key("bwd", H, D)] = best_cfg
             self._save_cache()
+        self._fast[("bwd", H, D)] = best_cfg
         return best_cfg
 
     def clear(self):
         """Clear in-memory and on-disk cache (forces re-tuning)."""
         with self._lock:
             self._cache.clear()
+        self._fast.clear()
         try:
             if os.path.isfile(self._cache_file):
                 os.remove(self._cache_file)
@@ -2926,7 +2952,11 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             s_o.copy_(o);  s_do.copy_(do); s_L.copy_(L)
             s_rk.copy_(relay_k); s_rv.copy_(relay_v)
             g.replay()
-            return s_dq.clone(), s_dk.clone(), s_dv.clone()
+            # Return static output buffers directly — no clone needed.
+            # Safety: all ops are on the same default stream; the training loop
+            # serialises autograd consumption of s_dq/dk/dv before the next
+            # g.replay() overwrites them. Eliminates 3×16MB memcpy per layer.
+            return s_dq, s_dk, s_dv
 
     # CUDA graph cache for GQA split3 backward.
     # Key: (B, H_q, H_kv, S, D, KV_GROUPS, BLOCK_M, BLOCK_D, BLOCK_STRIDE,
@@ -3063,7 +3093,8 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             s_o.copy_(o);  s_do.copy_(do); s_L.copy_(L)
             s_rk.copy_(relay_k); s_rv.copy_(relay_v)
             g.replay()
-            return s_dq.clone(), s_dk.clone(), s_dv.clone()
+            # Return static output buffers directly — safe on single default stream.
+            return s_dq, s_dk, s_dv
 
     # ── RELAY-4 CUDA-graph cache (MHA, relay-active path) ─────────────────
     # Key: (B, H_q, S, D, NUM_RELAY, BLOCK_M, BLOCK_D, BLOCK_STRIDE,
@@ -3076,6 +3107,17 @@ class CronRootAttentionV14Function(torch.autograd.Function):
     # to a single graph.replay() (~5μs). Active for S > RELAY_THRESHOLD (256)
     # i.e. the entire S=512 training stage.
     _relay4_graph_cache: dict = {}
+
+    # CUDA graph cache for forward (skip_relay tiled path).
+    # Key: (B, H_q, H_kv, S, D, BLOCK_M, BLOCK_D, BLOCK_STRIDE, BLOCK_LOCAL,
+    #        kv_groups, device_idx)
+    # Value: (graph, s_q, s_k, s_v, s_o, s_L)
+    #
+    # Eliminates per-step Python overhead of 5×torch.empty() + 1 Triton
+    # kernel dispatch (~120μs/layer at S=512) by replaying a pre-captured
+    # CUDA graph (~5μs CPU).  For a 4-layer model: ~460μs saved per step.
+    # Same lifecycle as _split3_graphed: one warmup+capture per unique shape.
+    _fwd_graph_cache: dict = {}
 
     @staticmethod
     def _relay4_launch(q, k, v, o, do, L, relay_k, relay_v, relay_src,
@@ -3260,8 +3302,110 @@ class CronRootAttentionV14Function(torch.autograd.Function):
                 (s_d_rk.float() * s_rk.float()).sum(dim=(0, 2, 3))
                 + (s_d_rv.float() * s_rv.float()).sum(dim=(0, 2, 3))
             )  # [H_q]; caller converts dtype if needed
-            return (s_dq.clone(), s_dk.clone(), s_dv.clone(),
-                    s_d_rk.clone(), s_d_rv.clone(), d_relay_log_scale)
+            # Static output buffers returned directly (safe, same default stream).
+            return (s_dq, s_dk, s_dv,
+                    s_d_rk, s_d_rv, d_relay_log_scale)
+
+    @staticmethod
+    def _fwd_launch_skip_relay(s_q, s_k, s_v, s_o, s_L, s_rk, s_rv,
+                               S, D, SQRT_N, BLOCK_M, BLOCK_D, BLOCK_LOCAL,
+                               BLOCK_STRIDE, BLOCK_RELAY, B, H_q, kv_groups,
+                               fwd_nw, fwd_ns):
+        """Raw forward tiled kernel (skip_relay path).  Only called during
+        _fwd_graphed_skip_relay warmup; never on the steady-state hot path."""
+        num_tiles = (S + BLOCK_M - 1) // BLOCK_M
+        _cron_root_attn_fwd_v14_tiled[(B, H_q, num_tiles)](
+            s_q, s_k, s_v, s_o, s_L,
+            s_rk, s_rv,
+            s_q.stride(0), s_q.stride(1), s_q.stride(2), s_q.stride(3),
+            s_k.stride(0), s_k.stride(1), s_k.stride(2), s_k.stride(3),
+            s_v.stride(0), s_v.stride(1), s_v.stride(2), s_v.stride(3),
+            s_o.stride(0), s_o.stride(1), s_o.stride(2), s_o.stride(3),
+            s_L.stride(0), s_L.stride(1), s_L.stride(2),
+            s_rk.stride(0), s_rk.stride(1), s_rk.stride(2), s_rk.stride(3),
+            s_rv.stride(0), s_rv.stride(1), s_rv.stride(2), s_rv.stride(3),
+            S=S, D=D, SQRT_N=SQRT_N,
+            NUM_RELAY=0, BLOCK_RELAY=BLOCK_RELAY,
+            BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
+            BLOCK_LOCAL=BLOCK_LOCAL, BLOCK_STRIDE=BLOCK_STRIDE,
+            KV_GROUPS=kv_groups,
+            TOP_K=2,
+            num_warps=fwd_nw, num_stages=fwd_ns,
+        )
+
+    @staticmethod
+    def _fwd_graphed_skip_relay(q, k, v,
+                                S, D, SQRT_N, BLOCK_M, BLOCK_D, BLOCK_LOCAL,
+                                BLOCK_STRIDE, BLOCK_RELAY, B, H_q, H_kv,
+                                kv_groups, fwd_nw, fwd_ns):
+        """Forward CUDA graph for the skip_relay tiled path (training hot path).
+
+        First call per shape: JIT-compiles the Triton kernel + captures CUDA graph.
+        Subsequent calls: copies q/k/v into static buffers, calls graph.replay()
+        (~5μs CPU overhead vs ~120μs for 5×empty()+kernel dispatch), clones o/L
+        so the static buffers are free for the next step without corrupting the
+        tensors saved for the backward pass.
+
+        Memory overhead: holds 5 BF16 tensors + 1 FP32 tensor of shape
+        (B,H,S,D) / (B,H,S) per unique (B,H_q,H_kv,S,D,kv_groups) — same
+        lifecycle as _split3_graph_cache.
+        """
+        cache = CronRootAttentionV14Function._fwd_graph_cache
+        cache_key = (B, H_q, H_kv, S, D, BLOCK_M, BLOCK_D, BLOCK_STRIDE,
+                     BLOCK_LOCAL, kv_groups, q.device.index)
+
+        if cache_key not in cache:
+            # Two-stream setup: warmup on default stream (Triton reads
+            # torch.cuda.current_stream()), capture on non-default stream
+            # (PyTorch CUDAGraph API requirement).
+            _wup_stream = torch.cuda.default_stream(q.device)
+            _cap_stream = torch.cuda.Stream(device=q.device)
+
+            with torch.cuda.stream(_wup_stream):
+                # ── Static I/O buffers (fixed GPU addresses) ──────────────
+                s_q  = q.clone();  s_k = k.clone();  s_v = v.clone()
+                s_o  = torch.empty_like(q)
+                s_L  = torch.empty(B, H_q, S, dtype=torch.float32, device=q.device)
+                # Dummy relay buffers: NUM_RELAY=0 so kernel never reads them,
+                # but strides are recorded in the captured graph — sizes must
+                # be consistent between warmup and every future replay call.
+                s_rk = torch.empty(B, H_kv, 1, D, device=q.device, dtype=q.dtype)
+                s_rv = torch.empty(B, H_kv, 1, D, device=q.device, dtype=q.dtype)
+
+                # ── Warmup: JIT-compile Triton outside the capture ─────────
+                _wup_stream.synchronize()
+                CronRootAttentionV14Function._fwd_launch_skip_relay(
+                    s_q, s_k, s_v, s_o, s_L, s_rk, s_rv,
+                    S, D, SQRT_N, BLOCK_M, BLOCK_D, BLOCK_LOCAL,
+                    BLOCK_STRIDE, BLOCK_RELAY, B, H_q, kv_groups,
+                    fwd_nw, fwd_ns)
+                _wup_stream.synchronize()
+
+            # ── Capture on non-default stream ─────────────────────────────
+            with torch.cuda.stream(_cap_stream):
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, stream=_cap_stream):
+                    CronRootAttentionV14Function._fwd_launch_skip_relay(
+                        s_q, s_k, s_v, s_o, s_L, s_rk, s_rv,
+                        S, D, SQRT_N, BLOCK_M, BLOCK_D, BLOCK_LOCAL,
+                        BLOCK_STRIDE, BLOCK_RELAY, B, H_q, kv_groups,
+                        fwd_nw, fwd_ns)
+            # Sync before caching: capture also executes kernels once on
+            # _cap_stream. Without this sync, the first replay's s_q.copy_()
+            # on default_stream races with _cap_stream still reading s_q →
+            # cudaErrorIllegalAddress.  Fires only once per unique shape.
+            _cap_stream.synchronize()
+
+            cache[cache_key] = (g, s_q, s_k, s_v, s_o, s_L)
+
+        g, s_q, s_k, s_v, s_o, s_L = cache[cache_key]
+
+        with torch.cuda.stream(torch.cuda.default_stream(q.device)):
+            s_q.copy_(q);  s_k.copy_(k);  s_v.copy_(v)
+            g.replay()
+            # Clone outputs so the static buffers can be overwritten on the
+            # next step without corrupting o/L held in the backward ctx.
+            return s_o.clone(), s_L.clone()
 
     @staticmethod
     def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -3337,10 +3481,6 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             relay_k = relay_k * _relay_scale[None, :, None, None]
             relay_v = relay_v * _relay_scale[None, :, None, None]
 
-        # Allocate outputs
-        o = torch.empty_like(q)
-        L = torch.empty(B, H_q, S, dtype=torch.float32, device=q.device)
-
         num_tiles = (S + BLOCK_M - 1) // BLOCK_M
 
         if use_persistent and skip_relay:
@@ -3348,6 +3488,8 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             # work queue. Optimal for S <= auto_persistent_threshold (default 4096).
             # Relay skipped: for S <= RELAY_THRESHOLD the strided path covers global
             # context with no extra overhead.
+            o = torch.empty_like(q)
+            L = torch.empty(B, H_q, S, dtype=torch.float32, device=q.device)
             total_tiles = B * H_q * num_tiles
             work_ctr = torch.zeros(1, dtype=torch.int32, device=q.device)
             _cron_root_attn_fwd_v14_persistent[(_get_num_sms(),)](
@@ -3368,13 +3510,24 @@ class CronRootAttentionV14Function(torch.autograd.Function):
             # Inline auto-tune: first call per (H, D) benchmarks all candidates
             # using these actual tensors (~10ms one-time), then caches.
             if not _tuner.is_tuned("fwd", H_q, D):
+                # tune_fwd_inline needs o/L as scratch — allocate here only for
+                # the one-time auto-tune; hot path allocates below after tuning.
+                _o_tune = torch.empty_like(q)
+                _L_tune = torch.empty(B, H_q, S, dtype=torch.float32, device=q.device)
                 fwd_nw, fwd_ns = _tuner.tune_fwd_inline(
-                    q, k, v, o, L, relay_k, relay_v,
+                    q, k, v, _o_tune, _L_tune, relay_k, relay_v,
                     S, D, SQRT_N, NUM_RELAY, BLOCK_RELAY,
                     BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE,
                     kv_groups, H_q, B)
+                del _o_tune, _L_tune
             else:
                 fwd_nw, fwd_ns = _tuner.get_config("fwd", H_q, D)
+            # Allocate outputs and dispatch tiled kernel directly — no CUDA graph
+            # wrapper here.  Adding static-buffer copy_() overhead at training
+            # batch sizes (B=32: 3×16MB in + 2×16MB out = ~400μs per layer) costs
+            # more than the ~50μs dispatch savings, so direct dispatch wins.
+            o = torch.empty_like(q)
+            L = torch.empty(B, H_q, S, dtype=torch.float32, device=q.device)
             _cron_root_attn_fwd_v14_tiled[(B, H_q, num_tiles)](
                 q, k, v, o, L,
                 relay_k, relay_v,
