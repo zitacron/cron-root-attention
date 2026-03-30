@@ -45,9 +45,10 @@ Licensed under Apache 2.0 — see LICENSE for details.
 from __future__ import annotations
 
 import argparse
+import gc
 import random
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -287,10 +288,118 @@ def _validate(
     return 100.0 * n_correct / max(n_total, 1)
 
 
-def _jit_warmup(model: nn.Module, seq_len: int, device: str) -> None:
-    """Single forward+backward to trigger Triton JIT compilation before training."""
+# ---------------------------------------------------------------------------
+# Isolated kernel speed benchmark (matches README methodology)
+# ---------------------------------------------------------------------------
+
+def bench_kernels(
+    d_model: int,
+    n_heads: int,
+    seq_lens: List[int],
+    backends: List[str],
+    batch_size: int,
+    device: str,
+    n_repeats: int = 30,
+    silent: bool = False,
+) -> Dict:
+    """
+    Pure attention fwd+bwd timing with CUDA events — directly comparable to README.
+    No MLP, no optimizer, no Python overhead. Returns dict[(backend, seq_len)] -> ms.
+
+    silent=True suppresses all output (used when called purely for attn% calculation).
+    """
+    head_dim = d_model // n_heads
+    if not silent:
+        print(f"\n{'='*72}")
+        print(f"KERNEL SPEED BENCHMARK  (H={n_heads}x D={head_dim} = {d_model}-dim, B={batch_size})")
+        print(f"  fwd+bwd, CUDA events, {n_repeats} repeats, 10% trimmed mean")
+        print(f"  Isolates ONLY the attention kernel — directly matches README numbers.")
+        print(f"{'='*72}")
+        print(f"  {'S':>7}  {'Backend':<8}  {'Fwd+Bwd ms':>12}  {'vs SDPA':>10}")
+        print(f"  {'-'*46}")
+
+    from cron_root_attention import cron_root_attention
+
+    def _timed(fn) -> float:
+        for _ in range(max(5, n_repeats // 4)):
+            fn()
+        torch.cuda.synchronize()
+        ev_s = [torch.cuda.Event(enable_timing=True) for _ in range(n_repeats)]
+        ev_e = [torch.cuda.Event(enable_timing=True) for _ in range(n_repeats)]
+        for i in range(n_repeats):
+            ev_s[i].record()
+            fn()
+            ev_e[i].record()
+        torch.cuda.synchronize()
+        times = sorted(ev_s[i].elapsed_time(ev_e[i]) for i in range(n_repeats))
+        trim = max(1, len(times) // 10)
+        t = times[trim:-trim] if len(times) > 2 * trim else times
+        return sum(t) / len(t)
+
+    results: Dict = {}
+    ordered = ["sdpa"] + [b for b in backends if b != "sdpa"]
+
+    for seq_len in seq_lens:
+        ref_ms: Optional[float] = None
+        row: Dict[str, Optional[float]] = {}
+
+        for backend in ordered:
+            gc.collect()
+            torch.cuda.empty_cache()
+            try:
+                q = torch.randn(batch_size, n_heads, seq_len, head_dim,
+                                device=device, dtype=torch.float16, requires_grad=True)
+                k = torch.randn_like(q)
+                v = torch.randn_like(q)
+
+                if backend == "sdpa":
+                    def _fn():
+                        o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+                        o.sum().backward()
+                        q.grad = k.grad = v.grad = None
+                else:
+                    def _fn():
+                        o = cron_root_attention(q, k, v)
+                        o.sum().backward()
+                        q.grad = k.grad = v.grad = None
+
+                ms = _timed(_fn)
+                row[backend] = ms
+                results[(backend, seq_len)] = ms
+                if backend == "sdpa":
+                    ref_ms = ms
+                del q, k, v
+                torch.cuda.empty_cache()
+            except Exception as e:
+                row[backend] = None
+                if not silent:
+                    print(f"  {seq_len:>7}  {backend:<8}  ERROR: {e}")
+
+        if not silent:
+            for backend in ordered:
+                ms = row.get(backend)
+                if ms is None:
+                    continue
+                if backend == "sdpa" or ref_ms is None:
+                    vs_str = "baseline"
+                    flag = ""
+                else:
+                    ratio = ref_ms / ms
+                    vs_str = f"{ratio:.2f}x"
+                    flag = "  ◀ FASTER" if ms < ref_ms else "  (slower)"
+                print(f"  {seq_len:>7}  {backend:<8}  {ms:>11.3f}ms  {vs_str:>10}{flag}")
+
+    return results
+
+
+def _jit_warmup(model: nn.Module, seq_len: int, batch_size: int, device: str) -> None:
+    """
+    Forward+backward at the ACTUAL training shapes to trigger Triton JIT and
+    torch.compile inductor compilation before the step timer window opens.
+    Using batch_size=1 here would cause a shape mismatch → recompile at step 1.
+    """
     print("  [CRA] JIT warmup...", end="", flush=True)
-    x = torch.zeros(1, seq_len, dtype=torch.long, device=device)
+    x = torch.zeros(batch_size, seq_len, dtype=torch.long, device=device)
     try:
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model(x)
@@ -317,6 +426,7 @@ def train_task(
     device: str,
     seed: int,
     compile_model: bool,
+    kernel_ms: Optional[float] = None,
 ) -> Dict:
     """Train one (task, backend, seq_len) configuration and return results dict."""
     torch.manual_seed(seed)
@@ -336,6 +446,7 @@ def train_task(
         backend=backend,
     ).to(device)
 
+
     print(
         f"\n{'='*64}\n"
         f"  {task_name}  backend={backend}  seq_len={seq_len}\n"
@@ -345,10 +456,11 @@ def train_task(
     )
 
     if backend in ("cra", "hybrid") and device != "cpu":
-        _jit_warmup(model, seq_len, device)
+        _jit_warmup(model, seq_len, batch_size, device)
 
     if compile_model and device != "cpu":
-        model = torch.compile(model, mode="reduce-overhead")
+        compile_mode = "default" if backend in ("cra", "hybrid") else "reduce-overhead"
+        model = torch.compile(model, mode=compile_mode)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -356,7 +468,6 @@ def train_task(
     )
     scaler = torch.amp.GradScaler("cuda")
 
-    # Pre-shuffle indices to avoid per-step randint CPU overhead
     perm = torch.randperm(n_train, device=device)
     perm_pos = 0
 
@@ -402,14 +513,28 @@ def train_task(
             )
             recent_losses = []
 
+    total_s = time.time() - t0
+    # Amortized step time over entire run (includes compile cost spread evenly).
+    _step_ms = total_s * 1000 / n_steps
+
+    # Attention fraction: kernel_ms is timed at actual batch_size (silent bench),
+    # so n_layers * kernel_ms / _step_ms gives the true attention % of a step.
+    attn_pct: Optional[float] = None
+    if kernel_ms is not None and _step_ms > 0:
+        attn_pct = min(99.9, 100.0 * kernel_ms * n_layers / _step_ms)
+
+    attn_str = f"  attn≈{attn_pct:.0f}% of step" if attn_pct is not None else ""
+    print(f"  ↳ avg step: {_step_ms:.1f}ms/step{attn_str}")
+
     return {
         "task": task_name,
         "backend": backend,
         "seq_len": seq_len,
         "val_acc": val_acc,
-        "time_s": time.time() - t0,
+        "time_s": total_s,
+        "step_ms": _step_ms,
+        "attn_pct": attn_pct,
     }
-
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -433,9 +558,13 @@ def main() -> None:
     parser.add_argument("--n_samples",  type=int,   default=4096)
     parser.add_argument("--gpu",        type=int,   default=1,
                         help="CUDA device index")
-    parser.add_argument("--no_compile", action="store_true",
+    parser.add_argument("--no_compile",      action="store_true",
                         help="Disable torch.compile")
-    parser.add_argument("--seed",       type=int,   default=42)
+    parser.add_argument("--no_kernel_bench", action="store_true",
+                        help="Skip isolated kernel speed benchmark")
+    parser.add_argument("--kernel_repeats",  type=int, default=30,
+                        help="Timed repeats for kernel benchmark (trimmed mean)")
+    parser.add_argument("--seed",            type=int, default=42)
     args = parser.parse_args()
 
     # Device setup
@@ -462,6 +591,32 @@ def main() -> None:
         f"  lr={args.lr}  n_samples={args.n_samples}"
     )
 
+    # ── Isolated kernel speed benchmark ────────────────────────────────────
+    kernel_times: Dict = {}
+    kernel_times_train: Dict = {}
+    if not args.no_kernel_bench and device != "cpu":
+        # B=1 run for README-comparable numbers (displayed)
+        kernel_times = bench_kernels(
+            d_model=args.d_model,
+            n_heads=args.n_heads,
+            seq_lens=args.seq_lens,
+            backends=args.backends,
+            batch_size=1,
+            device=device,
+            n_repeats=args.kernel_repeats,
+        )
+        # B=batch_size run for accurate attn% fraction (silent)
+        kernel_times_train = bench_kernels(
+            d_model=args.d_model,
+            n_heads=args.n_heads,
+            seq_lens=args.seq_lens,
+            backends=args.backends,
+            batch_size=args.batch_size,
+            device=device,
+            n_repeats=10,
+            silent=True,
+        )
+
     results: List[Dict] = []
 
     # ── MQAR ────────────────────────────────────────────────────────────────
@@ -483,6 +638,7 @@ def main() -> None:
                     d_model=args.d_model, n_heads=args.n_heads,
                     n_layers=args.n_layers, lr=args.lr,
                     device=device, seed=args.seed, compile_model=compile_model,
+                    kernel_ms=kernel_times_train.get((backend, seq_len)),
                 ))
 
     # ── Selective Copy ────────────────────────────────────────────────────────
@@ -503,18 +659,23 @@ def main() -> None:
                     d_model=args.d_model, n_heads=args.n_heads,
                     n_layers=args.n_layers, lr=args.lr,
                     device=device, seed=args.seed, compile_model=compile_model,
+                    kernel_ms=kernel_times_train.get((backend, seq_len)),
                 ))
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    print(f"\n{'='*64}")
+    print(f"\n{'='*72}")
     print("RESULTS")
-    print(f"{'='*64}")
-    print(f"  {'Task':<6}  {'S':>6}  {'Backend':<7}  {'Val Acc':>9}  {'Time':>8}")
-    print(f"  {'-'*52}")
+    print(f"{'='*72}")
+    print(f"  {'Task':<6}  {'S':>6}  {'Backend':<7}  {'Val Acc':>9}  {'ms/step':>9}  {'Attn%':>7}  {'Total':>8}")
+    print(f"  {'-'*64}")
     for r in results:
+        attn_str = f"{r['attn_pct']:>6.0f}%" if r.get("attn_pct") is not None else f"{'—':>7}"
         print(
             f"  {r['task']:<6}  {r['seq_len']:>6}"
-            f"  {r['backend']:<7}  {r['val_acc']:>8.1f}%  {r['time_s']:>7.1f}s"
+            f"  {r['backend']:<7}  {r['val_acc']:>8.1f}%"
+            f"  {r.get('step_ms', 0):>8.1f}ms"
+            f"  {attn_str}"
+            f"  {r['time_s']:>7.1f}s"
         )
 
     # Delta table: CRA vs SDPA
