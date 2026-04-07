@@ -1087,10 +1087,10 @@ def _cron_root_attn_fwd_v14_tiled(
         m_i = m_new
     
     # =================================================================
-    # PHASE 3: Relay Keys (2-hop aggregated block means)
+    # PHASE 3: Relay Keys (2-hop exact top-K representatives)
     # =================================================================
     # Each relay block r summarizes positions [r*SQRT_N, (r+1)*SQRT_N)
-    # via mean-pooling of K and V. This carries compressed 2-hop info
+    # via top-K exact-token selection. This carries compressed 2-hop info
     # through a SINGLE softmax, eliminating gradient dilution.
     # A relay block is accessible if the entire block is before local_start(m).
     
@@ -2618,9 +2618,9 @@ def _dkdv_relay_v14_gqa(
 # With K=2: each block contributes 2 exact representative tokens.
 # Total relay tokens: NUM_RELAY_BLOCKS * K, still O(K·√N) per sequence.
 #
-# Memory profile vs old pooling (K=2, SQRT_N=64, D=128):
+# Memory profile vs old pooling (K=4, SQRT_N=64, D=128):
 #   Old: reads 64 K rows + 64 V rows = 128 rows
-#   New: reads 64 K rows (norm scan) + 2 K rows + 2 V rows = 68 rows  (47% less)
+#   New: reads 64 K rows (norm scan) + 4 K rows + 4 V rows = 72 rows  (44% less)
 #
 # Algorithm:
 #   Pass 1: scan SQRT_N positions, compute ‖kᵢ‖², track top-K indices in registers.
@@ -2661,13 +2661,17 @@ def _relay_precompute_topk(
     d_mask  = d_idx < D
     k_base  = K + b * stride_kb + h * stride_kh
 
-    # ── Pass 1: scan norm² for all positions, track top-2 ─────────────────────
+    # ── Pass 1: scan norm² for all positions, track top-4 ─────────────────────
     # Sentinel: valid norms are ≥ 0, so -1e38 marks "unset".
     SENT = -1e38
     best0_nsq = tl.full([], SENT, dtype=tl.float32)
     best0_idx = tl.zeros([], dtype=tl.int32)
     best1_nsq = tl.full([], SENT, dtype=tl.float32)
     best1_idx = tl.zeros([], dtype=tl.int32)
+    best2_nsq = tl.full([], SENT, dtype=tl.float32)
+    best2_idx = tl.zeros([], dtype=tl.int32)
+    best3_nsq = tl.full([], SENT, dtype=tl.float32)
+    best3_idx = tl.zeros([], dtype=tl.int32)
 
     for i in range(SQRT_N):
         s_i     = s_start + i
@@ -2677,18 +2681,31 @@ def _relay_precompute_topk(
         n_sq    = tl.sum(k_row * k_row)
         n_sq    = tl.where(valid_i, n_sq, tl.full([], SENT, dtype=tl.float32))
         i_t     = tl.full([], i, dtype=tl.int32)
+        # Insertion sort into top-4: cascade from position 0 downward
         beats0  = n_sq > best0_nsq
         beats1  = n_sq > best1_nsq
-        # Update top-2 (evaluate new top1 before overwriting top0)
+        beats2  = n_sq > best2_nsq
+        beats3  = n_sq > best3_nsq
+        # Update top-4 (evaluate bottom-up to avoid aliasing)
+        new3_nsq = tl.where(beats2, best2_nsq, tl.where(beats3, n_sq,  best3_nsq))
+        new3_idx = tl.where(beats2, best2_idx, tl.where(beats3, i_t,   best3_idx))
+        new2_nsq = tl.where(beats1, best1_nsq, tl.where(beats2, n_sq,  best2_nsq))
+        new2_idx = tl.where(beats1, best1_idx, tl.where(beats2, i_t,   best2_idx))
         new1_nsq = tl.where(beats0, best0_nsq, tl.where(beats1, n_sq,  best1_nsq))
         new1_idx = tl.where(beats0, best0_idx, tl.where(beats1, i_t,   best1_idx))
         best0_nsq = tl.where(beats0, n_sq, best0_nsq)
         best0_idx = tl.where(beats0, i_t,  best0_idx)
         best1_nsq = new1_nsq
         best1_idx = new1_idx
+        best2_nsq = new2_nsq
+        best2_idx = new2_idx
+        best3_nsq = new3_nsq
+        best3_idx = new3_idx
 
     abs0 = s_start + best0_idx   # absolute sequence position of best token
     abs1 = s_start + best1_idx   # absolute sequence position of 2nd-best token
+    abs2 = s_start + best2_idx   # absolute sequence position of 3rd-best token
+    abs3 = s_start + best3_idx   # absolute sequence position of 4th-best token
 
     # ── Pass 2: load exact k/v at top positions, write relay tokens ────────────
     rk_base = relay_k   + b * stride_rkb + h * stride_rkh
@@ -2711,6 +2728,24 @@ def _relay_precompute_topk(
         tl.store(rk_base + t1 * stride_rkt + d_idx * stride_rkd, k1, mask=d_mask)
         tl.store(rv_base + t1 * stride_rvt + d_idx * stride_rvd, v1, mask=d_mask)
         tl.store(rs_base + t1 * stride_rst, tl.cast(abs1, tl.float32))
+
+    if TOP_K >= 3:
+        t2 = r * TOP_K + 2
+        k2 = tl.load(k_base + abs2 * stride_ks + d_idx * stride_kd, mask=d_mask, other=0.0)
+        v2 = tl.load(V + b * stride_vb + h * stride_vh + abs2 * stride_vs + d_idx * stride_vd,
+                     mask=d_mask, other=0.0)
+        tl.store(rk_base + t2 * stride_rkt + d_idx * stride_rkd, k2, mask=d_mask)
+        tl.store(rv_base + t2 * stride_rvt + d_idx * stride_rvd, v2, mask=d_mask)
+        tl.store(rs_base + t2 * stride_rst, tl.cast(abs2, tl.float32))
+
+    if TOP_K >= 4:
+        t3 = r * TOP_K + 3
+        k3 = tl.load(k_base + abs3 * stride_ks + d_idx * stride_kd, mask=d_mask, other=0.0)
+        v3 = tl.load(V + b * stride_vb + h * stride_vh + abs3 * stride_vs + d_idx * stride_vd,
+                     mask=d_mask, other=0.0)
+        tl.store(rk_base + t3 * stride_rkt + d_idx * stride_rkd, k3, mask=d_mask)
+        tl.store(rv_base + t3 * stride_rvt + d_idx * stride_rvd, v3, mask=d_mask)
+        tl.store(rs_base + t3 * stride_rst, tl.cast(abs3, tl.float32))
 
 
 # =============================================================================
@@ -2788,12 +2823,11 @@ class CronRootAttentionV14Function(torch.autograd.Function):
     """Autograd function for V14 tiled √N attention with 2-hop relay."""
     
     # Relay skip threshold: relay is skipped for sequences at or below this
-    # length.  At S<=2048, strided+local provides adequate O(√N) coverage
-    # (~64-90 attention targets per query via 2-hop reachability).
-    # Setting to 2048 enables GQA backward compatibility at all practical
-    # training seq lengths — the relay backward kernels only support MHA.
-    # For S>2048 inference/training, relay activates and MHA is required.
-    RELAY_THRESHOLD = 2048
+    # length.  At S<=255, strided+local provides adequate O(√N) coverage.
+    # For S>=256, relay activates to provide 2-hop compressed context from
+    # distant blocks (top-K exact tokens per √N block).
+    # GQA backward is now supported via MHA expansion at the Python level.
+    RELAY_THRESHOLD = 255
     
     # Fused backward threshold: below this, use single-kernel backward
     # (fully fused dQ + local dK/dV + strided dK/dV) instead of 4-kernel approach.
@@ -3619,14 +3653,9 @@ class CronRootAttentionV14Function(torch.autograd.Function):
         
         use_fused_bwd = (S <= CronRootAttentionV14Function.FUSED_BWD_THRESHOLD)
         
-        # GQA (kv_groups > 1) with relay (S > RELAY_THRESHOLD) is not yet supported
-        # by the long-seq relay kernels.  Short-seq GQA now takes the split3-gqa path.
-        if not use_fused_bwd and ctx.kv_groups != 1:
-            raise NotImplementedError(
-                f"GQA (kv_groups={ctx.kv_groups}) is only supported for S <= "
-                f"{CronRootAttentionV14Function.FUSED_BWD_THRESHOLD}. "
-                f"Got S={S}. The long-seq backward kernels do not yet support GQA."
-            )
+        # GQA (kv_groups > 1) with relay is now supported: the relay backward
+        # expands relay_k/v to MHA shape, runs the MHA-only relay4 kernels,
+        # then collapses dk/dv back to KV-head shape.
         
         if skip_relay and ctx.kv_groups == 1:
             # MHA: always use split3 (CUDA graph eliminates 3× kernel-launch overhead)
@@ -3682,23 +3711,46 @@ class CronRootAttentionV14Function(torch.autograd.Function):
 
         else:
             # =============================================================
-            # RELAY-ACTIVE BACKWARD  (S > RELAY_THRESHOLD = 255)
+            # RELAY-ACTIVE BACKWARD  (S > RELAY_THRESHOLD)
             # =============================================================
-            if ctx.kv_groups != 1:
-                raise NotImplementedError(
-                    f"GQA (kv_groups={ctx.kv_groups}) is only supported for S <= "
-                    f"{CronRootAttentionV14Function.FUSED_BWD_THRESHOLD}. "
-                    f"Got S={S}. The long-seq backward kernels do not yet support GQA."
-                )
-            # MHA relay path: CUDA-graph-captured 6-kernel backward.
-            # Collapses dQ-only + local-dK/dV + strided-dK/dV + relay-dK/dV
-            # + relay_scatter×2 from ~300μs Python dispatch to ~5μs graph replay.
-            (dq, dk, dv,
-             d_relay_k, d_relay_v,
-             _d_rls_raw) = CronRootAttentionV14Function._relay4_graphed(
-                q, k, v, o, do, L, relay_k, relay_v, relay_src,
-                S, D, SQRT_N, NUM_RELAY, relay_top_k,
-                BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE, BLOCK_RELAY, B, H_q)
+            kv_groups = ctx.kv_groups
+            if kv_groups != 1:
+                # GQA relay backward: expand relay_k/v to MHA shape so the
+                # existing MHA-only relay4 kernels work, then collapse
+                # d_relay_k/v and dk/dv back to KV-head shape.
+                relay_k_mha = relay_k.unsqueeze(2).expand(B, H_kv, kv_groups, NUM_RELAY, D) \
+                                     .reshape(B, H_q, NUM_RELAY, D).contiguous()
+                relay_v_mha = relay_v.unsqueeze(2).expand(B, H_kv, kv_groups, NUM_RELAY, D) \
+                                     .reshape(B, H_q, NUM_RELAY, D).contiguous()
+                # relay_src is per-KV-head; expand to MHA for scatter
+                relay_src_mha = relay_src.unsqueeze(2).expand(B, H_kv, kv_groups, NUM_RELAY) \
+                                        .reshape(B, H_q, NUM_RELAY).contiguous()
+                # k/v are [B, H_kv, S, D]; expand to [B, H_q, S, D] for MHA backward
+                k_mha = k.unsqueeze(2).expand(B, H_kv, kv_groups, S, D) \
+                         .reshape(B, H_q, S, D).contiguous()
+                v_mha = v.unsqueeze(2).expand(B, H_kv, kv_groups, S, D) \
+                         .reshape(B, H_q, S, D).contiguous()
+                (dq, dk_mha, dv_mha,
+                 d_relay_k_mha, d_relay_v_mha,
+                 _d_rls_raw) = CronRootAttentionV14Function._relay4_graphed(
+                    q, k_mha, v_mha, o, do, L, relay_k_mha, relay_v_mha, relay_src_mha,
+                    S, D, SQRT_N, NUM_RELAY, relay_top_k,
+                    BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE, BLOCK_RELAY, B, H_q)
+                # Collapse dk/dv from [B, H_q, S, D] → [B, H_kv, kv_groups, S, D] → sum → [B, H_kv, S, D]
+                dk = dk_mha.view(B, H_kv, kv_groups, S, D).sum(dim=2)
+                dv = dv_mha.view(B, H_kv, kv_groups, S, D).sum(dim=2)
+                # _d_rls_raw is [H_q]; collapse to [H_kv] by summing groups
+                _d_rls_raw = _d_rls_raw.view(H_kv, kv_groups).sum(dim=1)
+            else:
+                # MHA relay path: CUDA-graph-captured 6-kernel backward.
+                # Collapses dQ-only + local-dK/dV + strided-dK/dV + relay-dK/dV
+                # + relay_scatter×2 from ~300μs Python dispatch to ~5μs graph replay.
+                (dq, dk, dv,
+                 d_relay_k, d_relay_v,
+                 _d_rls_raw) = CronRootAttentionV14Function._relay4_graphed(
+                    q, k, v, o, do, L, relay_k, relay_v, relay_src,
+                    S, D, SQRT_N, NUM_RELAY, relay_top_k,
+                    BLOCK_M, BLOCK_D, BLOCK_LOCAL, BLOCK_STRIDE, BLOCK_RELAY, B, H_q)
             if ctx.relay_log_scale is not None:
                 d_relay_log_scale = _d_rls_raw.to(ctx.relay_log_scale.dtype)
 
