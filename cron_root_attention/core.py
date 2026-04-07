@@ -2823,11 +2823,13 @@ class CronRootAttentionV14Function(torch.autograd.Function):
     """Autograd function for V14 tiled √N attention with 2-hop relay."""
     
     # Relay skip threshold: relay is skipped for sequences at or below this
-    # length.  At S<=255, strided+local provides adequate O(√N) coverage.
-    # For S>=256, relay activates to provide 2-hop compressed context from
-    # distant blocks (top-K exact tokens per √N block).
-    # GQA backward is now supported via MHA expansion at the Python level.
-    RELAY_THRESHOLD = 255
+    # length.  At S<=2048, strided+local provides adequate O(√N) coverage
+    # (~64-90 attention targets per query via 2-hop reachability).
+    # GQA backward is now supported via MHA expansion at the Python level,
+    # so relay CAN be enabled at lower thresholds if needed in the future.
+    # Kept at 2048 to keep CRA lean (~0.85 GFLOP/layer) — the 25% SDPA
+    # anchor layers provide full N² coverage for long-range dependencies.
+    RELAY_THRESHOLD = 2048
     
     # Fused backward threshold: below this, use single-kernel backward
     # (fully fused dQ + local dK/dV + strided dK/dV) instead of 4-kernel approach.
