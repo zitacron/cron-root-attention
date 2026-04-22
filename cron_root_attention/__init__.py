@@ -75,7 +75,8 @@ Usage:
 __version__ = "0.1.0"
 __author__ = "Zitacron"
 
-from .core import cron_root_attention_v14, get_num_sms, GPU_SM_MAP, _tuner
+from .core import (cron_root_attention_v14, cron_root_attention_varlen,
+                   warmup_varlen_shapes, get_num_sms, GPU_SM_MAP, _tuner)
 from .module import CronRootAttention, CronRootMultiheadAttention
 from .hybrid import cron_root_attention_hybrid, CronRootAttentionHybrid
 
@@ -207,6 +208,8 @@ cron_root_attention = cron_root_attention_v14
 __all__ = [
     "cron_root_attention",
     "cron_root_attention_v14",
+    "cron_root_attention_varlen",
+    "warmup_varlen_shapes",
     "CronRootAttention",
     "CronRootMultiheadAttention",
     "cron_root_attention_hybrid",

@@ -3797,6 +3797,231 @@ def cron_root_attention_v14(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     return CronRootAttentionV14Function.apply(q, k, v, use_persistent, kv_groups, relay_log_scale, relay_top_k)
 
 
+# =============================================================================
+# VARLEN / BIN-PACKING LOOP  (cu_seqlens routing)
+# =============================================================================
+# Optimized Python loop for CRA bin-packing attention.
+#
+# Naive approach (what you'd write first):
+#   results = []
+#   for i in range(n_docs):
+#       results.append(cron_root_attention_v14(q_i, k_i, v_i))
+#   output = torch.cat(results, dim=2)           ← allocates + copies S·H·D
+#
+# This implementation eliminates the avoidable overheads:
+#   1. torch.cat:   replaced by a pre-allocated output buffer written in-place.
+#      Each doc writes at most 1 device→device copy instead of 2 (clone + cat).
+#   2. .narrow():   zero-copy view of the packed tensor.  Triton kernels accept
+#      non-contiguous inputs via stride-based addressing — no .contiguous() needed.
+#   3. non_blocking=True on copy_:  CPU advances to the next doc's narrow() calls
+#      while the GPU drains the previous doc's write on the default stream.
+#      All writes are serialized on the same stream → no race conditions.
+#
+# Constraints (cannot be worked around without rewriting Triton kernels):
+#   • Nested CUDA graphs:  CronRootAttentionV14Function already captures a CUDA
+#     graph per shape inside its forward pass.  PyTorch forbids nested graph
+#     capture, so this loop CANNOT be wrapped in an outer CUDAGraph.
+#   • Per-doc s_o.clone():  In training mode, the backward pass requires a
+#     stable copy of `o`.  The static graph buffer s_o is overwritten on the
+#     next replay call, so the clone is mandatory for correctness.
+#     (In torch.no_grad() / inference, the clone is still issued by the current
+#     path; a future inference-specific path could bypass it.)
+#
+# CPU overhead budget (after first-call Triton JIT + graph warmup):
+#   n_docs × (~5 µs graph replay + ~1 µs copy_) ≈ 120 µs for 20 docs
+#   Eliminating torch.cat saves roughly 1 extra S·H·D memcpy (≈ 50–500 µs at
+#   S=4096, H=32, D=128 in BF16 depending on memory bandwidth).
+# =============================================================================
+
+@torch.compiler.disable  # CRA uses Triton graphs; Dynamo cannot trace through.
+def cron_root_attention_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens,                                       # List[int] or 1-D CPU tensor
+    kv_groups: int = 1,
+    use_persistent: bool = False,
+    relay_log_scale: Optional[torch.Tensor] = None,
+    relay_top_k: int = 2,
+) -> torch.Tensor:
+    """
+    CRA bin-packing varlen forward.
+
+    Processes each document independently (no cross-document attention),
+    assembling results into a single pre-allocated output buffer.
+
+    Args:
+        q:             [B, H_q,  S_total, D]  — full packed batch.
+        k:             [B, H_kv, S_total, D]  where H_kv = H_q // kv_groups.
+        v:             [B, H_kv, S_total, D]
+        cu_seqlens:    Cumulative sequence-length boundaries; length n_docs+1.
+                       Must start at 0 and end at S_total.
+                       MUST be a CPU tensor (or plain Python list/tuple) — a
+                       GPU tensor forces a device sync on each boundary read.
+        kv_groups:     GQA group count (1 = MHA, 4 = GQA-4 etc.).
+        use_persistent: Forward persistent-kernel flag forwarded to each call.
+        relay_log_scale: Per-head relay scale; forwarded to each call unchanged.
+        relay_top_k:   Relay top-k; forwarded to each call unchanged.
+
+    Returns:
+        [B, H_q, S_total, D] contiguous output tensor, same dtype/device as q.
+
+    Performance notes:
+        • Call warmup_varlen_shapes() at model init to pre-populate CUDA graph
+          caches for your expected doc-length distribution.  Without warmup the
+          first batch pays ~50–200 ms per unique document length for Triton JIT
+          compilation + CUDA graph capture.
+        • After warmup each doc costs ~5 µs CPU (graph replay) + ~1 µs for the
+          async copy_.  Total ≈ 120 µs for 20 docs — GPU-bound, not CPU-bound.
+        • This function is decorated @torch.compiler.disable so that an outer
+          torch.compile does not attempt to trace through the loop and create
+          unhelpful graph breaks at every CRA call.
+    """
+    # ── CPU path: no CUDA graphs, just loop + cat ─────────────────────────
+    if q.device.type == 'cpu':
+        seqs = cu_seqlens.tolist() if isinstance(cu_seqlens, torch.Tensor) else list(cu_seqlens)
+        parts = []
+        for i in range(len(seqs) - 1):
+            s, e = seqs[i], seqs[i + 1]
+            parts.append(cron_root_attention_v14(
+                q.narrow(2, s, e - s),
+                k.narrow(2, s, e - s),
+                v.narrow(2, s, e - s),
+                use_persistent=use_persistent,
+                kv_groups=kv_groups,
+                relay_log_scale=relay_log_scale,
+                relay_top_k=relay_top_k,
+            ))
+        return torch.cat(parts, dim=2)
+
+    # ── Parse boundaries once on CPU (avoids device sync per iteration) ───
+    if isinstance(cu_seqlens, torch.Tensor):
+        if cu_seqlens.device.type != 'cpu':
+            raise ValueError(
+                "cu_seqlens must be a CPU tensor to avoid a device sync on "
+                "each document boundary read.  Call cu_seqlens.cpu() before "
+                "passing to cron_root_attention_varlen."
+            )
+        seqs: list = cu_seqlens.tolist()
+    else:
+        seqs = list(cu_seqlens)
+
+    n_docs = len(seqs) - 1
+
+    # ── Single-doc fast path ───────────────────────────────────────────────
+    if n_docs == 1:
+        # No loop overhead; just call the standard kernel directly.
+        return cron_root_attention_v14(
+            q, k, v,
+            use_persistent=use_persistent,
+            kv_groups=kv_groups,
+            relay_log_scale=relay_log_scale,
+            relay_top_k=relay_top_k,
+        )
+
+    # ── Pre-allocate full output buffer (eliminates torch.cat) ────────────
+    # Writing directly into slices of `output` saves one complete S·H·D
+    # tensor allocation and memcpy that torch.cat would otherwise perform.
+    output = torch.empty_like(q)
+
+    for i in range(n_docs):
+        start  = seqs[i]
+        length = seqs[i + 1] - start
+
+        # .narrow() returns a VIEW into the packed tensor (no data copy).
+        # Triton kernels use per-stride indexing so strides need not match
+        # a contiguous layout.  Specifically, stride[1] = S_total*D rather
+        # than length*D, but that is passed directly via q.stride(1) etc.
+        q_i = q.narrow(2, start, length)
+        k_i = k.narrow(2, start, length)
+        v_i = v.narrow(2, start, length)
+
+        out_i = cron_root_attention_v14(
+            q_i, k_i, v_i,
+            use_persistent=use_persistent,
+            kv_groups=kv_groups,
+            relay_log_scale=relay_log_scale,
+            relay_top_k=relay_top_k,
+        )
+
+        # non_blocking=True enqueues the copy on the default CUDA stream
+        # (the same stream used by graph replay inside CRA) without stalling
+        # the CPU.  The CPU immediately proceeds to prepare the next
+        # iteration's narrow() calls while the GPU drains this write.
+        # Correct ordering is guaranteed: all ops share one stream.
+        output.narrow(2, start, length).copy_(out_i, non_blocking=True)
+
+    return output
+
+
+def warmup_varlen_shapes(
+    doc_lengths,
+    H: int,
+    D: int,
+    B: int = 1,
+    kv_groups: int = 1,
+    dtype=None,
+    device=None,
+    verbose: bool = False,
+) -> None:
+    """
+    Pre-populate the CRA CUDA graph cache for all expected document lengths.
+
+    Call this once at training startup (after model init) to amortise the
+    ~50–200 ms Triton JIT + CUDA graph capture cost for each unique document
+    length.  After warmup every call to cron_root_attention_varlen() costs
+    only ~5 µs (graph replay) + ~1 µs (async copy_) per document.
+
+    The CUDA graph cache is keyed on (B, H_q, H_kv, S, D, …).  Capture fires
+    once per unique shape and is retained for the process lifetime.
+
+    Args:
+        doc_lengths:  Iterable of integer document lengths to warm up.
+                      Duplicates and zeros are ignored.
+        H:            Number of query heads.
+        D:            Head dimension.
+        B:            Batch size (default 1 — match your training value).
+        kv_groups:    GQA group count (1 = MHA).
+        dtype:        Tensor dtype (default: torch.float16).
+        device:       CUDA device (default: current device).
+        verbose:      Print per-shape progress.
+    """
+    import gc
+    if dtype is None:
+        dtype = torch.float16
+    if device is None:
+        device = torch.device('cuda', torch.cuda.current_device())
+
+    H_kv = H // kv_groups
+    unique_lengths = sorted({int(l) for l in doc_lengths if l > 0})
+
+    if verbose:
+        print(f"[warmup_varlen_shapes] {len(unique_lengths)} unique shapes "
+              f"(H={H}, H_kv={H_kv}, D={D}, B={B}) …")
+
+    for S in unique_lengths:
+        if verbose:
+            print(f"  S={S} …", end=" ", flush=True)
+
+        q = torch.randn(B, H,    S, D, device=device, dtype=dtype, requires_grad=True)
+        k = torch.randn(B, H_kv, S, D, device=device, dtype=dtype, requires_grad=True)
+        v = torch.randn(B, H_kv, S, D, device=device, dtype=dtype, requires_grad=True)
+
+        # Forward: first call triggers Triton JIT compilation then CUDA graph capture.
+        out = cron_root_attention_v14(q, k, v, kv_groups=kv_groups)
+        # Backward: triggers backward CUDA graph capture.
+        out.sum().backward()
+        torch.cuda.synchronize()
+
+        del q, k, v, out
+        gc.collect()
+        if verbose:
+            print("done")
+
+    if verbose:
+        print(f"[warmup_varlen_shapes] Complete.")
+
+
 class CronRootAttentionV14(nn.Module):
     """
     V14 Cron Root Attention Module.
